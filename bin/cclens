@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""cclens — terminal lens for Claude Code.
+
+  cclens sessions [--all] [--limit N]   sessions + context window usage
+  cclens diff [SESSION] [--list]        original vs modified code, colored
+  cclens diff --all-sessions            diff every session that has baselines
+
+Zero dependencies beyond python3 + git (for colored diffs).
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+LENS_HOME = os.path.expanduser(os.environ.get("CC_LENS_HOME", "~/.claude/cc-lens"))
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+TAIL_BYTES = 512 * 1024
+HEAD_BYTES = 256 * 1024
+
+USE_COLOR = sys.stdout.isatty() or os.environ.get("CC_LENS_COLOR") == "1"
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+
+
+def dim(s):    return c("2", s)
+def bold(s):   return c("1", s)
+def green(s):  return c("32", s)
+def yellow(s): return c("33", s)
+def red(s):    return c("31", s)
+def cyan(s):   return c("36", s)
+
+
+# ---------------------------------------------------------------- sessions
+
+def sanitize(path):
+    return re.sub(r"[^A-Za-z0-9-]", "-", path)
+
+
+def context_limit(model, tokens=0):
+    m = (model or "").lower()
+    if "[1m]" in m or "sonnet-5" in m or "fable" in m:
+        return 1_000_000
+    # observed footprint above 200k means the session runs an extended window
+    return 1_000_000 if tokens > 200_000 else 200_000
+
+
+def tail_lines(path, nbytes):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - nbytes))
+            chunk = f.read()
+    except OSError:
+        return []
+    lines = chunk.split(b"\n")
+    return lines[1:] if size > nbytes else lines  # drop possibly-truncated first line
+
+
+def head_lines(path, nbytes):
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(nbytes)
+    except OSError:
+        return []
+    return chunk.split(b"\n")[:-1]
+
+
+def parse_session(path):
+    """Return info dict for one transcript jsonl, or None if unreadable."""
+    info = {
+        "id": os.path.basename(path)[:-6],
+        "path": path,
+        "mtime": os.path.getmtime(path),
+        "cwd": "",
+        "label": "",
+        "model": "",
+        "tokens": None,
+    }
+    # last assistant message with usage -> current context footprint
+    for raw in reversed(tail_lines(path, TAIL_BYTES)):
+        if b'"usage"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant" or obj.get("isSidechain"):
+            continue
+        usage = (obj.get("message") or {}).get("usage") or {}
+        if "input_tokens" not in usage:
+            continue
+        info["model"] = (obj.get("message") or {}).get("model", "")
+        info["tokens"] = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("output_tokens", 0)
+        )
+        info["cwd"] = obj.get("cwd", "")
+        break
+    # first real user prompt -> label
+    for raw in head_lines(path, HEAD_BYTES):
+        if b'"user"' not in raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get("type") != "user" or obj.get("isMeta") or obj.get("isSidechain"):
+            continue
+        content = (obj.get("message") or {}).get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text", "")
+                    break
+        text = " ".join(text.split())
+        if "<command-" in text:
+            m = re.search(r"<command-args>(.*?)(</command-args>|$)", text)
+            name = re.search(r"<command-name>(.*?)</command-name>", text)
+            text = ((name.group(1) + " ") if name else "") + (m.group(1) if m else "")
+            text = text.strip()
+        if text.startswith("<") or not text:
+            continue  # system-reminder / tool-result wrappers
+        info["label"] = text[:57] + "…" if len(text) > 58 else text
+        if not info["cwd"]:
+            info["cwd"] = obj.get("cwd", "")
+        break
+    return info
+
+
+def bar(pct, width=20):
+    filled = min(width, round(pct / 100 * width))
+    paint = green if pct < 60 else yellow if pct < 85 else red
+    return paint("█" * filled) + dim("░" * (width - filled))
+
+
+def fmt_tokens(n):
+    return f"{n / 1000:.1f}k" if n < 1_000_000 else f"{n / 1_000_000:.2f}M"
+
+
+def cmd_sessions(argv):
+    show_all = "--all" in argv
+    limit = 0
+    if "--limit" in argv:
+        limit = int(argv[argv.index("--limit") + 1])
+
+    if show_all:
+        files = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+    else:
+        proj = os.path.join(PROJECTS, sanitize(os.getcwd()))
+        files = glob.glob(os.path.join(proj, "*.jsonl"))
+        if not files:
+            print(dim(f"no sessions for {os.getcwd()} — showing all projects (use --all to silence)"))
+            files = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+
+    sessions = [s for s in (parse_session(f) for f in files) if s and s["tokens"] is not None]
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    total = len(sessions)
+    if limit:
+        sessions = sessions[:limit]
+
+    scope = "all projects" if show_all or not files else os.getcwd()
+    print(bold(f"● {total} session(s)") + dim(f"  [{scope}]") + "\n")
+    if not sessions:
+        return
+
+    import datetime
+    for s in sessions:
+        lim = context_limit(s["model"], s["tokens"])
+        pct = s["tokens"] / lim * 100
+        when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+        line1 = f"  {cyan(s['id'][:8])}  {bar(pct)} {pct:5.1f}%  {fmt_tokens(s['tokens']):>7} / {fmt_tokens(lim)}  {dim(when)}"
+        print(line1)
+        detail = s["label"] or dim("(no prompt)")
+        proj = s["cwd"].replace(HOME, "~") if s["cwd"] else ""
+        print(f"           {detail}" + (dim(f"  · {proj}") if proj and (show_all or True) else ""))
+    print()
+
+
+# ---------------------------------------------------------------- diff
+
+def baseline_sessions():
+    root = os.path.join(LENS_HOME, "baselines")
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for sid in os.listdir(root):
+        idx = os.path.join(root, sid, "index.json")
+        if os.path.isfile(idx):
+            out.append((sid, os.path.getmtime(idx)))
+    out.sort(key=lambda t: t[1], reverse=True)
+    return [sid for sid, _ in out]
+
+
+def diff_one_session(sid, verbose=True):
+    sdir = os.path.join(LENS_HOME, "baselines", sid)
+    try:
+        with open(os.path.join(sdir, "index.json")) as f:
+            index = json.load(f)
+    except Exception:
+        print(red(f"cannot read baselines for session {sid}"))
+        return
+    files = index.get("files", {})
+    meta = index.get("_meta", {})
+    print(bold(f"● session {sid[:8]}") + dim(f"  {meta.get('cwd', '')}  {meta.get('started', '')}") +
+          f"  — {len(files)} file(s) touched")
+    if not files:
+        return
+    for fpath in sorted(files):
+        key = files[fpath]
+        orig = os.path.join(sdir, key) if key else os.devnull
+        cur = fpath if os.path.exists(fpath) else os.devnull
+        if key is None:
+            tag = green("[new]")
+        elif cur == os.devnull:
+            tag = red("[deleted]")
+        else:
+            tag = yellow("[modified]")
+        print(f"\n{tag} {bold(fpath)}")
+        color = "--color=always" if USE_COLOR else "--color=never"
+        r = subprocess.run(
+            ["git", "diff", "--no-index", color,
+             "--src-prefix=original/", "--dst-prefix=current/", "--", orig, cur],
+            capture_output=True, text=True)
+        out = r.stdout.strip()
+        if key:  # show the real path, not the snapshot's internal path
+            out = out.replace(orig.lstrip("/"), fpath.lstrip("/"))
+        if not out and r.returncode == 0:
+            print(dim("  (no changes — file was restored to original)"))
+        else:
+            # drop the noisy "diff --git" / index header lines
+            body = [l for l in out.splitlines() if not re.match(r"^\x1b?\[?[0-9;]*m?(diff --git|index )", l.lstrip("\x1b[0-9;m"))]
+            print("\n".join(body) if body else out)
+    print()
+
+
+def cmd_diff(argv):
+    sids = baseline_sessions()
+    if "--list" in argv:
+        if not sids:
+            print(dim("no snapshots yet — cc-lens records baselines when Claude edits files"))
+            return
+        for sid in sids:
+            idx = json.load(open(os.path.join(LENS_HOME, "baselines", sid, "index.json")))
+            n = len(idx.get("files", {}))
+            print(f"  {cyan(sid)}  {n} file(s)  {dim(idx.get('_meta', {}).get('cwd', ''))}")
+        return
+    if "--all-sessions" in argv:
+        for sid in sids:
+            diff_one_session(sid)
+        if not sids:
+            print(dim("no snapshots yet — cc-lens records baselines when Claude edits files"))
+        return
+    target = next((a for a in argv if not a.startswith("-")), None)
+    if target:
+        match = [s for s in sids if s.startswith(target)]
+        if not match:
+            print(red(f"no session matching '{target}'. Try: cclens diff --list"))
+            sys.exit(1)
+        diff_one_session(match[0])
+    elif sids:
+        diff_one_session(sids[0])
+    else:
+        print(dim("no snapshots yet — cc-lens records baselines when Claude edits files"))
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    if "--color" in args:
+        global USE_COLOR
+        USE_COLOR = True
+        args = [a for a in args if a != "--color"]
+    cmd, rest = args[0], args[1:]
+    if cmd == "sessions":
+        cmd_sessions(rest)
+    elif cmd == "diff":
+        cmd_diff(rest)
+    else:
+        print(f"unknown command: {cmd}\n\n{__doc__.strip()}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

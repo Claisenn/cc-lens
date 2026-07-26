@@ -1,0 +1,12 @@
+{
+  "name": "cc-lens-marketplace",
+  "owner": { "name": "Claisenn" },
+  "description": "cc-lens: terminal diff of original vs modified code, and per-session context window usage for Claude Code.",
+  "plugins": [
+    {
+      "name": "cc-lens",
+      "source": "./",
+      "description": "Terminal lens for Claude Code: colored diff of original vs modified code, plus per-session context window usage."
+    }
+  ]
+}
