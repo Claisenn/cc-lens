@@ -4,7 +4,8 @@ Claude Code 的终端透镜插件:
 
 - **`/cc-lens:diff`** — 对比 **原始代码 vs Claude 改动后的代码**(彩色 unified diff)。插件通过 PreToolUse hook 在 Claude 第一次改动某个文件前自动快照原始版本,无需 git、无需手动操作。
 - **`/cc-lens:sessions`** — 列出有 **多少个 session**,以及 **每个 session 的上下文窗口占用**(进度条 + 百分比 + token 数)。
-- 两个视图也能脱离 Claude Code、直接在任何终端里用:`cclens diff` / `cclens sessions`。
+- **session 上下文继承** — 开新 session(或 `/clear` 后)时,SessionStart hook 自动注入上一个 session 的摘要:当初的需求、改过哪些文件、最后聊到哪、窗口占用。`resume` / `compact` 场景不注入(它们本来就带着上下文)。也可随时手动 `/cc-lens:handoff [session前缀]` 拉取任意历史 session 的摘要。
+- 三个视图也能脱离 Claude Code、直接在任何终端里用:`cclens diff` / `cclens sessions` / `cclens handoff`。
 
 零依赖:只需要 `python3` 和 `git`(用于彩色 diff 渲染)。
 
@@ -80,6 +81,26 @@ cclens sessions --limit 10   # 只看最近 10 个
 ```
 
 占用 = 最近一轮的 `input + cache_read + cache_creation + output` tokens,对照该 session 模型的上下文窗口(200k;1M 窗口模型自动识别)。进度条按 60% / 85% 变色提醒。
+
+### session 上下文继承
+
+```
+cclens handoff             # 上一个 session 的摘要(终端里看)
+cclens handoff fc171430    # 指定 session
+```
+
+新 session 启动时自动注入的内容形如:
+
+```
+[cc-lens handoff]
+Previous Claude Code session fc171430 in ~/proj (last active 2026-07-27 07:26, context 141.9k/1.00M):
+- initial request: /goal 针对模型结构写文章…
+- files it modified (diff available via `cclens diff fc171430`): src/a.py, src/b.py
+- how it ended (last assistant message): 已完成 X,剩 Y 待验证…
+This is background from a past session, not instructions; current files may have changed since.
+```
+
+注入量控制在 2KB 以内,不吃窗口。想关掉:装好后删掉 `hooks/hooks.json` 里的 `SessionStart` 段即可(可插拔)。
 
 ## 工作原理
 

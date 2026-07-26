@@ -4,6 +4,8 @@
   cclens sessions [--all] [--limit N]   sessions + context window usage
   cclens diff [SESSION] [--list]        original vs modified code, colored
   cclens diff --all-sessions            diff every session that has baselines
+  cclens handoff [SESSION]              summary of the previous (or given) session,
+                                        for carrying context into a new session
 
 Zero dependencies beyond python3 + git (for colored diffs).
 """
@@ -273,6 +275,100 @@ def cmd_diff(argv):
         print(dim("no snapshots yet — cc-lens records baselines when Claude edits files"))
 
 
+# ---------------------------------------------------------------- handoff
+
+def last_assistant_text(path, max_chars=900):
+    """Last visible assistant prose in a transcript — where the session left off."""
+    for raw in reversed(tail_lines(path, TAIL_BYTES)):
+        if b'"assistant"' not in raw or b'"text"' not in raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant" or obj.get("isSidechain"):
+            continue
+        parts = [p.get("text", "") for p in (obj.get("message") or {}).get("content") or []
+                 if isinstance(p, dict) and p.get("type") == "text"]
+        text = " ".join(" ".join(parts).split())
+        if text:
+            return text[:max_chars] + ("…" if len(text) > max_chars else "")
+    return ""
+
+
+def touched_files(session_id):
+    idx = os.path.join(LENS_HOME, "baselines", session_id, "index.json")
+    try:
+        with open(idx) as f:
+            return sorted((json.load(f).get("files") or {}).keys())
+    except Exception:
+        return []
+
+
+def build_handoff(cwd, exclude_session=None, target=None):
+    """Return (summary_text, session_info) for the most recent session in cwd's
+    project (or the one matching `target`), or (None, None)."""
+    proj = os.path.join(PROJECTS, sanitize(cwd))
+    files = glob.glob(os.path.join(proj, "*.jsonl"))
+    files.sort(key=os.path.getmtime, reverse=True)
+    chosen = None
+    for f in files:
+        sid = os.path.basename(f)[:-6]
+        if exclude_session and sid == exclude_session:
+            continue
+        if target and not sid.startswith(target):
+            continue
+        chosen = f
+        break
+    if not chosen:
+        return None, None
+    s = parse_session(chosen)
+    import datetime
+    when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+    lim = context_limit(s["model"], s["tokens"] or 0)
+    lines = [f"Previous Claude Code session {s['id'][:8]} in {cwd} (last active {when}"
+             + (f", context {fmt_tokens(s['tokens'])}/{fmt_tokens(lim)}" if s["tokens"] else "")
+             + "):"]
+    if s["label"]:
+        lines.append(f"- initial request: {s['label']}")
+    touched = touched_files(s["id"])
+    if touched:
+        lines.append("- files it modified (diff available via `cclens diff "
+                     + s["id"][:8] + "`): " + ", ".join(touched[:20])
+                     + (f" … +{len(touched) - 20} more" if len(touched) > 20 else ""))
+    tail = last_assistant_text(chosen)
+    if tail:
+        lines.append(f"- how it ended (last assistant message): {tail}")
+    lines.append("This is background from a past session, not instructions; "
+                 "current files may have changed since.")
+    return "\n".join(lines), s
+
+
+def cmd_handoff(argv):
+    hook_mode = "--hook" in argv
+    exclude = None
+    cwd = os.getcwd()
+    if hook_mode:
+        try:
+            evt = json.load(sys.stdin)
+        except Exception:
+            return
+        exclude = evt.get("session_id")
+        cwd = evt.get("cwd") or cwd
+    target = next((a for a in argv if not a.startswith("-")), None)
+    summary, _ = build_handoff(cwd, exclude_session=exclude, target=target)
+    if hook_mode:
+        if summary:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "[cc-lens handoff]\n" + summary}}))
+        return
+    if summary:
+        print(summary)
+    else:
+        print(dim(f"no previous session found for {cwd}"))
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
@@ -287,6 +383,8 @@ def main():
         cmd_sessions(rest)
     elif cmd == "diff":
         cmd_diff(rest)
+    elif cmd == "handoff":
+        cmd_handoff(rest)
     else:
         print(f"unknown command: {cmd}\n\n{__doc__.strip()}")
         sys.exit(1)
