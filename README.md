@@ -1,11 +1,13 @@
 # cc-lens
 
-Claude Code 的终端透镜插件:
+Claude Code **和 Codex CLI** 的终端透镜插件:
 
 - **`/cc-lens:diff`** — 对比 **原始代码 vs Claude 改动后的代码**(彩色 unified diff)。插件通过 PreToolUse hook 在 Claude 第一次改动某个文件前自动快照原始版本,无需 git、无需手动操作。
 - **`/cc-lens:sessions`** — 列出有 **多少个 session**,以及 **每个 session 的上下文窗口占用**(进度条 + 百分比 + token 数)。
 - **session 上下文继承** — 开新 session(或 `/clear` 后)时,SessionStart hook 自动注入上一个 session 的摘要:当初的需求、改过哪些文件、最后聊到哪、窗口占用。`resume` / `compact` 场景不注入(它们本来就带着上下文)。也可随时手动 `/cc-lens:handoff [session前缀]` 拉取任意历史 session 的摘要。
-- 三个视图也能脱离 Claude Code、直接在任何终端里用:`cclens diff` / `cclens sessions` / `cclens handoff`。
+- **滚动进展笔记** — 每轮结束后 Stop hook 在后台用廉价模型(Haiku,失败自动退 `codex exec`,都没有就退回纯规则摘录)滚动维护一份 ≤120 词的笔记(Goal / Done / Decisions / Pending),prompt 强约束"只许摘录不许推断"。handoff 注入时优先用笔记,没有笔记就用零幻觉的尾部摘录保底。hook 本体毫秒级返回,绝不拖慢对话。
+- **Codex 同样适用** — `cclens sessions` 同时统计 `~/.codex/sessions` 的 rollout(带 `claude`/`codex` 标签);快照 hook 能解析 apply_patch 的 patch 文本,diff / 笔记 / handoff 注入在 Codex 里同样工作(Codex ≥0.114 的 hooks 与 Claude Code 同构)。
+- 三个视图也能脱离两个 CLI、直接在任何终端里用:`cclens diff` / `cclens sessions` / `cclens handoff`。
 
 零依赖:只需要 `python3` 和 `git`(用于彩色 diff 渲染)。
 
@@ -26,6 +28,25 @@ Claude Code 的终端透镜插件:
 git clone https://github.com/Claisenn/cc-lens.git
 export PATH="$PATH:$(pwd)/cc-lens/bin"
 ```
+
+### Codex 接入
+
+```bash
+git clone https://github.com/Claisenn/cc-lens.git ~/cc-lens
+~/cc-lens/bin/cclens install codex     # 合并进 ~/.codex/hooks.json(先自动备份,不动你已有的 hook)
+```
+
+然后在 Codex 里跑一次 `/hooks` 审阅并信任(Codex 按 hash 信任钉住 hook)。卸载:删掉 hooks.json 里 command 含 `cc-lens` 的条目即可。
+
+### 笔记 summarizer 配置(可选)
+
+`~/.claude/cc-lens/config.json`:
+
+```json
+{ "summarizer": "auto" }   // auto | claude | codex | off
+```
+
+`off` 表示不用模型,handoff 退回纯规则摘录(零成本零幻觉)。
 
 ## 使用
 

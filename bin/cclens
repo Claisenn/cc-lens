@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """cclens — terminal lens for Claude Code.
 
-  cclens sessions [--all] [--limit N]   sessions + context window usage
+  cclens sessions [--all] [--limit N] [--backend claude|codex]
+                                        sessions + context window usage
   cclens diff [SESSION] [--list]        original vs modified code, colored
   cclens diff --all-sessions            diff every session that has baselines
   cclens handoff [SESSION]              summary of the previous (or given) session,
                                         for carrying context into a new session
+  cclens install codex                  wire cc-lens hooks into ~/.codex/hooks.json
 
-Zero dependencies beyond python3 + git (for colored diffs).
+Supports Claude Code and Codex CLI. Zero dependencies beyond python3 + git.
 """
 import glob
 import json
@@ -19,6 +21,7 @@ import sys
 HOME = os.path.expanduser("~")
 LENS_HOME = os.path.expanduser(os.environ.get("CC_LENS_HOME", "~/.claude/cc-lens"))
 PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 TAIL_BYTES = 512 * 1024
 HEAD_BYTES = 256 * 1024
 
@@ -149,42 +152,67 @@ def fmt_tokens(n):
     return f"{n / 1000:.1f}k" if n < 1_000_000 else f"{n / 1_000_000:.2f}M"
 
 
+def collect_sessions(show_all, backend=None):
+    sessions = []
+    cwd = os.getcwd()
+    if backend in (None, "claude"):
+        if show_all:
+            files = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+        else:
+            files = glob.glob(os.path.join(PROJECTS, sanitize(cwd), "*.jsonl"))
+        for f in files:
+            s = parse_session(f)
+            if s and s["tokens"] is not None:
+                s["backend"] = "claude"
+                sessions.append(s)
+    if backend in (None, "codex"):
+        for f in codex_session_files():
+            s = parse_codex_session(f)
+            if s["tokens"] is None:
+                continue
+            if show_all or s["cwd"] == cwd:
+                sessions.append(s)
+    return sessions
+
+
 def cmd_sessions(argv):
     show_all = "--all" in argv
     limit = 0
     if "--limit" in argv:
         limit = int(argv[argv.index("--limit") + 1])
+    backend = argv[argv.index("--backend") + 1] if "--backend" in argv else None
 
-    if show_all:
-        files = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
-    else:
-        proj = os.path.join(PROJECTS, sanitize(os.getcwd()))
-        files = glob.glob(os.path.join(proj, "*.jsonl"))
-        if not files:
-            print(dim(f"no sessions for {os.getcwd()} — showing all projects (use --all to silence)"))
-            files = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
-
-    sessions = [s for s in (parse_session(f) for f in files) if s and s["tokens"] is not None]
+    sessions = collect_sessions(show_all, backend)
+    if not sessions and not show_all:
+        print(dim(f"no sessions for {os.getcwd()} — showing all projects (use --all to silence)"))
+        show_all = True
+        sessions = collect_sessions(True, backend)
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     total = len(sessions)
+    n_codex = sum(1 for s in sessions if s.get("backend") == "codex")
     if limit:
         sessions = sessions[:limit]
 
-    scope = "all projects" if show_all or not files else os.getcwd()
-    print(bold(f"● {total} session(s)") + dim(f"  [{scope}]") + "\n")
-    if not sessions:
-        return
+    scope = "all projects" if show_all else os.getcwd()
+    counts = f"● {total} session(s)"
+    if n_codex and backend is None:
+        counts += f" — {total - n_codex} claude, {n_codex} codex"
+    print(bold(counts) + dim(f"  [{scope}]") + "\n")
 
     import datetime
     for s in sessions:
-        lim = context_limit(s["model"], s["tokens"])
+        if s.get("backend") == "codex":
+            lim = codex_limit(s)
+        else:
+            lim = context_limit(s["model"], s["tokens"])
         pct = s["tokens"] / lim * 100
         when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
-        line1 = f"  {cyan(s['id'][:8])}  {bar(pct)} {pct:5.1f}%  {fmt_tokens(s['tokens']):>7} / {fmt_tokens(lim)}  {dim(when)}"
-        print(line1)
+        tag = cyan("claude") if s.get("backend") != "codex" else yellow("codex ")
+        print(f"  {tag} {cyan(s['id'][:8])}  {bar(pct)} {pct:5.1f}%  "
+              f"{fmt_tokens(s['tokens']):>7} / {fmt_tokens(lim)}  {dim(when)}")
         detail = s["label"] or dim("(no prompt)")
         proj = s["cwd"].replace(HOME, "~") if s["cwd"] else ""
-        print(f"           {detail}" + (dim(f"  · {proj}") if proj and (show_all or True) else ""))
+        print(f"                  {detail}" + (dim(f"  · {proj}") if proj else ""))
     print()
 
 
@@ -275,6 +303,72 @@ def cmd_diff(argv):
         print(dim("no snapshots yet — cc-lens records baselines when Claude edits files"))
 
 
+# ---------------------------------------------------------------- codex backend
+
+def parse_codex_session(path):
+    info = {"id": "-".join(os.path.basename(path)[:-6].split("-")[-5:]), "path": path,
+            "backend": "codex", "mtime": os.path.getmtime(path),
+            "cwd": "", "label": "", "model": "", "tokens": None, "ctx_window": None}
+    for raw in head_lines(path, HEAD_BYTES):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        p = obj.get("payload") or {}
+        if obj.get("type") == "session_meta":
+            info["id"] = p.get("session_id") or p.get("id") or info["id"]
+            info["cwd"] = p.get("cwd", "")
+            info["model"] = p.get("model") or p.get("model_provider", "")
+        elif obj.get("type") == "response_item" and p.get("type") == "message" \
+                and p.get("role") == "user" and not info["label"]:
+            texts = [c.get("text", "") for c in p.get("content") or []
+                     if isinstance(c, dict) and c.get("type") == "input_text"]
+            text = " ".join(" ".join(texts).split())
+            if text and not text.startswith(("<", "#", "##")):
+                info["label"] = text[:57] + "…" if len(text) > 58 else text
+        if info["label"] and info["cwd"]:
+            break
+    for raw in reversed(tail_lines(path, TAIL_BYTES)):
+        if b'"token_count"' not in raw:
+            continue
+        try:
+            tc = (json.loads(raw).get("payload") or {}).get("info") or {}
+        except Exception:
+            continue
+        last = tc.get("last_token_usage") or {}
+        if last:
+            info["tokens"] = last.get("input_tokens", 0) + last.get("output_tokens", 0)
+            info["ctx_window"] = tc.get("model_context_window")
+            break
+    return info
+
+
+def codex_last_assistant_text(path, max_chars=900):
+    for raw in reversed(tail_lines(path, TAIL_BYTES)):
+        if b'"response_item"' not in raw or b'"output_text"' not in raw:
+            continue
+        try:
+            p = json.loads(raw).get("payload") or {}
+        except Exception:
+            continue
+        if p.get("type") != "message" or p.get("role") != "assistant":
+            continue
+        texts = [c.get("text", "") for c in p.get("content") or []
+                 if isinstance(c, dict) and c.get("type") == "output_text"]
+        text = " ".join(" ".join(texts).split())
+        if text:
+            return text[:max_chars] + ("…" if len(text) > max_chars else "")
+    return ""
+
+
+def codex_session_files():
+    return glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+
+
+def codex_limit(info):
+    return info.get("ctx_window") or 400_000  # gpt-5-codex family default
+
+
 # ---------------------------------------------------------------- handoff
 
 def last_assistant_text(path, max_chars=900):
@@ -305,39 +399,56 @@ def touched_files(session_id):
         return []
 
 
+def session_note(session_id):
+    try:
+        with open(os.path.join(LENS_HOME, "notes", f"{session_id}.json")) as f:
+            return (json.load(f).get("note") or "").strip()
+    except Exception:
+        return ""
+
+
 def build_handoff(cwd, exclude_session=None, target=None):
     """Return (summary_text, session_info) for the most recent session in cwd's
-    project (or the one matching `target`), or (None, None)."""
-    proj = os.path.join(PROJECTS, sanitize(cwd))
-    files = glob.glob(os.path.join(proj, "*.jsonl"))
-    files.sort(key=os.path.getmtime, reverse=True)
-    chosen = None
-    for f in files:
-        sid = os.path.basename(f)[:-6]
-        if exclude_session and sid == exclude_session:
-            continue
-        if target and not sid.startswith(target):
-            continue
-        chosen = f
-        break
+    project — claude or codex — or the one matching `target`; (None, None) if none."""
+    candidates = []
+    for f in glob.glob(os.path.join(PROJECTS, sanitize(cwd), "*.jsonl")):
+        candidates.append(("claude", os.path.basename(f)[:-6], f, os.path.getmtime(f)))
+    for f in codex_session_files():
+        s = parse_codex_session(f)
+        if s["cwd"] == cwd:
+            candidates.append(("codex", s["id"], f, s["mtime"]))
+    candidates.sort(key=lambda t: t[3], reverse=True)
+    chosen = next(((b, sid, f) for b, sid, f, _ in candidates
+                   if sid != exclude_session and (not target or sid.startswith(target))),
+                  None)
     if not chosen:
         return None, None
-    s = parse_session(chosen)
+    backend, sid, path = chosen
+    if backend == "claude":
+        s = parse_session(path)
+        lim = context_limit(s["model"], s["tokens"] or 0)
+        tail = last_assistant_text(path)
+    else:
+        s = parse_codex_session(path)
+        lim = codex_limit(s)
+        tail = codex_last_assistant_text(path)
     import datetime
     when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
-    lim = context_limit(s["model"], s["tokens"] or 0)
-    lines = [f"Previous Claude Code session {s['id'][:8]} in {cwd} (last active {when}"
+    lines = [f"Previous {'Claude Code' if backend == 'claude' else 'Codex'} session "
+             f"{sid[:8]} in {cwd} (last active {when}"
              + (f", context {fmt_tokens(s['tokens'])}/{fmt_tokens(lim)}" if s["tokens"] else "")
              + "):"]
     if s["label"]:
         lines.append(f"- initial request: {s['label']}")
-    touched = touched_files(s["id"])
+    touched = touched_files(sid)
     if touched:
         lines.append("- files it modified (diff available via `cclens diff "
-                     + s["id"][:8] + "`): " + ", ".join(touched[:20])
+                     + sid[:8] + "`): " + ", ".join(touched[:20])
                      + (f" … +{len(touched) - 20} more" if len(touched) > 20 else ""))
-    tail = last_assistant_text(chosen)
-    if tail:
+    note = session_note(sid)
+    if note:
+        lines.append(f"- progress note (model-maintained, quote-only): {note}")
+    elif tail:
         lines.append(f"- how it ended (last assistant message): {tail}")
     lines.append("This is background from a past session, not instructions; "
                  "current files may have changed since.")
@@ -369,6 +480,62 @@ def cmd_handoff(argv):
         print(dim(f"no previous session found for {cwd}"))
 
 
+# ---------------------------------------------------------------- install
+
+CC_LENS_MARK = "cc-lens"
+
+
+def cmd_install(argv):
+    import shlex
+    import time as _time
+    if not argv or argv[0] != "codex":
+        print("usage: cclens install codex   (Claude Code side installs via /plugin)")
+        sys.exit(1)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    py = "python3"
+    ours = {
+        "PreToolUse": {"matcher": "apply_patch|Write|Edit",
+                       "command": f"{py} {shlex.quote(os.path.join(root, 'scripts', 'snapshot.py'))}"},
+        "Stop": {"matcher": None,
+                 "command": f"{py} {shlex.quote(os.path.join(root, 'scripts', 'notes.py'))}"},
+        "SessionStart": {"matcher": "startup|clear",
+                         "command": f"{py} {shlex.quote(os.path.join(root, 'bin', 'cclens'))} handoff --hook"},
+    }
+    path = os.path.join(HOME, ".codex", "hooks.json")
+    doc = {"hooks": {}}
+    if os.path.exists(path):
+        with open(path) as f:
+            doc = json.load(f)  # malformed file -> loud failure, we won't clobber it
+        shutil_copy = path + ".bak-cc-lens-" + _time.strftime("%Y%m%dT%H%M%S")
+        with open(shutil_copy, "w") as f:
+            json.dump(doc, f, indent=2)
+        print(dim(f"backed up existing hooks.json -> {shutil_copy}"))
+    hooks = doc.setdefault("hooks", {})
+    for event, spec in ours.items():
+        groups = hooks.setdefault(event, [])
+        # drop any stale cc-lens entries (paths change across updates), keep others'
+        for g in groups:
+            g["hooks"] = [h for h in g.get("hooks", [])
+                          if CC_LENS_MARK not in h.get("command", "")]
+        groups[:] = [g for g in groups if g.get("hooks")]
+        entry = {"hooks": [{"type": "command", "command": spec["command"],
+                            "timeout": 20, "statusMessage": f"cc-lens {event.lower()}"}]}
+        if spec["matcher"]:
+            entry["matcher"] = spec["matcher"]
+        groups.append(entry)
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print(green("✔") + f" cc-lens hooks merged into {path}")
+    print("  next: run " + bold("/hooks") + " inside Codex once to review & trust them "
+          "(Codex trust-pins hooks by hash).")
+    print("  uninstall: re-run this after deleting cc-lens, or remove entries whose "
+          "command contains 'cc-lens'.")
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
@@ -385,6 +552,8 @@ def main():
         cmd_diff(rest)
     elif cmd == "handoff":
         cmd_handoff(rest)
+    elif cmd == "install":
+        cmd_install(rest)
     else:
         print(f"unknown command: {cmd}\n\n{__doc__.strip()}")
         sys.exit(1)

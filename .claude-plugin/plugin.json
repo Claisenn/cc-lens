@@ -1,7 +1,7 @@
 {
   "name": "cc-lens",
   "displayName": "CC Lens",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Terminal lens for Claude Code: colored diff of original vs modified code, plus per-session context window usage.",
   "author": { "name": "Claisenn", "url": "https://github.com/Claisenn" },
   "homepage": "https://github.com/Claisenn/cc-lens",
