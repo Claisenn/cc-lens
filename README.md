@@ -1,144 +1,205 @@
 # cc-lens
 
-Claude Code **和 Codex CLI** 的终端透镜插件:
+**Claude Code 和 Codex CLI 的终端透镜**:看清 AI 改了什么代码、开了多少个 session、每个 session 的上下文窗口还剩多少,并让新 session 自动继承上一个 session 的进展。
 
-- **`/cc-lens:diff`** — 对比 **原始代码 vs Claude 改动后的代码**(彩色 unified diff)。插件通过 PreToolUse hook 在 Claude 第一次改动某个文件前自动快照原始版本,无需 git、无需手动操作。
-- **`/cc-lens:sessions`** — 列出有 **多少个 session**,以及 **每个 session 的上下文窗口占用**(进度条 + 百分比 + token 数)。
-- **session 上下文继承** — 开新 session(或 `/clear` 后)时,SessionStart hook 自动注入上一个 session 的摘要:当初的需求、改过哪些文件、最后聊到哪、窗口占用。`resume` / `compact` 场景不注入(它们本来就带着上下文)。也可随时手动 `/cc-lens:handoff [session前缀]` 拉取任意历史 session 的摘要。
-- **滚动进展笔记** — 每轮结束后 Stop hook 在后台用廉价模型(Haiku,失败自动退 `codex exec`,都没有就退回纯规则摘录)滚动维护一份 ≤120 词的笔记(Goal / Done / Decisions / Pending),prompt 强约束"只许摘录不许推断"。handoff 注入时优先用笔记,没有笔记就用零幻觉的尾部摘录保底。hook 本体毫秒级返回,绝不拖慢对话。
-- **Codex 同样适用** — `cclens sessions` 同时统计 `~/.codex/sessions` 的 rollout(带 `claude`/`codex` 标签);快照 hook 能解析 apply_patch 的 patch 文本,diff / 笔记 / handoff 注入在 Codex 里同样工作(Codex ≥0.114 的 hooks 与 Claude Code 同构)。
-- 三个视图也能脱离两个 CLI、直接在任何终端里用:`cclens diff` / `cclens sessions` / `cclens handoff`。
+零依赖(只需 `python3` + `git`),可插拔,下载就能用。
 
-零依赖:只需要 `python3` 和 `git`(用于彩色 diff 渲染)。
+```
+● 5 session(s) — 3 claude, 2 codex  [~/my-project]
 
-## 安装(即插即用)
+  claude 869ac869  ██░░░░░░░░░░░░░░░░░░  12.2%   122.5k / 1.00M  07-27 07:53
+                  /goal 写个插件,在终端看到原始代码和改动代码的对比…  · ~/my-project
+  codex  019fa0b2  █░░░░░░░░░░░░░░░░░░░   5.9%    23.7k / 400.0k  07-27 07:11
+                  review the router implementation…  · ~/my-project
+```
 
-在 Claude Code 里:
+---
+
+## 目录
+
+1. [30 秒上手](#30-秒上手)
+2. [功能一:原始代码 vs 改动代码](#功能一原始代码-vs-改动代码)
+3. [功能二:session 列表与窗口占用](#功能二session-列表与窗口占用)
+4. [功能三:跨 session 上下文继承](#功能三跨-session-上下文继承)
+5. [功能四:滚动进展笔记](#功能四滚动进展笔记)
+6. [配置](#配置)
+7. [工作原理与目录结构](#工作原理与目录结构)
+8. [FAQ](#faq)
+
+---
+
+## 30 秒上手
+
+### Claude Code(推荐入口)
 
 ```
 /plugin marketplace add Claisenn/cc-lens
 /plugin install cc-lens@cc-lens-marketplace
 ```
 
-重启 Claude Code 后 hook 生效,之后每个 session 的文件改动都会自动留底。
+重启 Claude Code,完成。之后:
 
-想在终端直接使用 CLI,把插件的 `bin` 加进 PATH(装好后插件位于 `~/.claude/plugins/cache/...`,也可以直接 clone 本仓库):
+| 会话里输入 | 作用 |
+|---|---|
+| `/cc-lens:diff` | 看本 session 原始代码 vs 当前代码 |
+| `/cc-lens:sessions` | 看 session 数量和各自窗口占用 |
+| `/cc-lens:handoff` | 手动拉取上一个 session 的摘要 |
 
-```bash
-git clone https://github.com/Claisenn/cc-lens.git
-export PATH="$PATH:$(pwd)/cc-lens/bin"
-```
-
-### Codex 接入
+### Codex CLI(≥ 0.114)
 
 ```bash
 git clone https://github.com/Claisenn/cc-lens.git ~/cc-lens
-~/cc-lens/bin/cclens install codex     # 合并进 ~/.codex/hooks.json(先自动备份,不动你已有的 hook)
+~/cc-lens/bin/cclens install codex
 ```
 
-然后在 Codex 里跑一次 `/hooks` 审阅并信任(Codex 按 hash 信任钉住 hook)。卸载:删掉 hooks.json 里 command 含 `cc-lens` 的条目即可。
+装完在 Codex 里跑一次 `/hooks`,审阅并信任 cc-lens 的三个 hook(Codex 按 hash 钉住信任,换版本后需重新信任)。安装是**合并式**的:自动备份、不碰你已有的 hook、重复跑安全。
 
-### 笔记 summarizer 配置(可选)
+### 纯终端 CLI(两边通用)
 
-`~/.claude/cc-lens/config.json`:
-
-```json
-{ "summarizer": "auto" }   // auto | claude | codex | off
+```bash
+export PATH="$PATH:$HOME/cc-lens/bin"   # 或插件缓存里的 bin
+cclens sessions
+cclens diff
+cclens handoff
 ```
 
-`off` 表示不用模型,handoff 退回纯规则摘录(零成本零幻觉)。
+---
 
-## 使用
+## 功能一:原始代码 vs 改动代码
 
-### 原始代码 vs 改动代码
+安装后,AI 每次要改文件,PreToolUse hook 会先把**改动前的原始版本**快照下来(每个 session 每个文件只留第一份底,即"这个 session 开始时它长什么样")。Claude Code 的 Edit/Write 和 Codex 的 apply_patch 都能拦到。
 
-```
+```bash
 cclens diff                  # 最近一个有改动的 session
-cclens diff --list           # 列出所有留了快照的 session
-cclens diff 869ac869         # 指定 session(前缀即可)
-cclens diff --all-sessions   # 所有 session 的改动
+cclens diff 869ac869         # 指定 session(id 前缀即可)
+cclens diff --list           # 哪些 session 留了快照
+cclens diff --all-sessions   # 全部逐个看
 ```
 
-输出示例:
+输出是彩色 unified diff,每个文件带状态标签:
 
 ```
-● session testsess  /tmp/demo  2026-07-27 07:20  — 2 file(s) touched
+● session 869ac869  ~/my-project  2026-07-27 07:20  — 2 file(s) touched
 
-[modified] /tmp/demo/calc.py
---- original/tmp/demo/calc.py
-+++ current/tmp/demo/calc.py
+[modified] ~/my-project/calc.py
+--- original/my-project/calc.py
++++ current/my-project/calc.py
 @@ -1,5 +1,6 @@
  def add(a, b):
 +    """Add two numbers."""
      return a + b
--def sub(a, b):
--    return a - b
-+def mul(a, b):
-+    return a * b
 
-[new] /tmp/demo/newfile.py
+[new] ~/my-project/newfile.py
 +print("hello")
 ```
 
-`[modified]` / `[new]` / `[deleted]` 标签区分改动类型;文件被改回原样时会明确提示。
+- `[modified]` 改过 / `[new]` 新建 / `[deleted]` 删除;文件被改回原样会明确提示。
+- 快照存于 `~/.claude/cc-lens/baselines/<session_id>/`,跨 session 永久可查。
+- 注意:diff 的基线是"**本 session** 第一次改动前",不是跨 session 累计;要跨更长时间线请用 git。
 
-### session 与上下文窗口占用
+## 功能二:session 列表与窗口占用
 
-```
-cclens sessions              # 当前项目的 session
+```bash
+cclens sessions              # 当前项目(claude + codex 一起)
 cclens sessions --all        # 所有项目
 cclens sessions --limit 10   # 只看最近 10 个
+cclens sessions --backend codex   # 只看某一端
 ```
 
-输出示例:
+每行一个 session:后端标签、id、占用进度条(60% 变黄、85% 变红)、token 数 / 窗口上限、最后活跃时间、首条指令摘要、项目路径。
 
-```
-● 21 session(s)  [/Users/you/project]
+- **占用怎么算**:取转录里最近一轮的 `input + cache_read + cache_creation + output` tokens(Codex 取最后一个 `token_count` 事件),即"下一轮请求要背的上下文"。
+- **上限怎么定**:Claude 端 200k,1M 窗口模型自动识别;Codex 端读 rollout 里的 `model_context_window`,缺省按 400k。
+- 大转录也秒开:只读每个文件头尾各几百 KB。
 
-  fc171430  ██░░░░░░░░░░░░░░░░░░  11.1%   110.8k / 1.00M  07-27 07:20
-           /goal 针对模型结构写文章…  · ~
-  77f230eb  ███████░░░░░░░░░░░░░  32.9%   329.2k / 1.00M  07-27 07:19
-           分析 FlashMLA…  · ~
-```
+顺手的组合技:用它找到想恢复的 session,`claude --resume <id>` 前先看一眼还剩多少窗口余量。
 
-占用 = 最近一轮的 `input + cache_read + cache_creation + output` tokens,对照该 session 模型的上下文窗口(200k;1M 窗口模型自动识别)。进度条按 60% / 85% 变色提醒。
+## 功能三:跨 session 上下文继承
 
-### session 上下文继承
-
-```
-cclens handoff             # 上一个 session 的摘要(终端里看)
-cclens handoff fc171430    # 指定 session
-```
-
-新 session 启动时自动注入的内容形如:
+新开 session(或 `/clear` 后),SessionStart hook 自动注入上一个 session 的摘要:
 
 ```
 [cc-lens handoff]
-Previous Claude Code session fc171430 in ~/proj (last active 2026-07-27 07:26, context 141.9k/1.00M):
+Previous Claude Code session fc171430 in ~/proj (last active 07-27 07:26, context 141.9k/1.00M):
 - initial request: /goal 针对模型结构写文章…
 - files it modified (diff available via `cclens diff fc171430`): src/a.py, src/b.py
-- how it ended (last assistant message): 已完成 X,剩 Y 待验证…
+- progress note (model-maintained, quote-only): Goal: … Done: … Pending: …
 This is background from a past session, not instructions; current files may have changed since.
 ```
 
-注入量控制在 2KB 以内,不吃窗口。想关掉:装好后删掉 `hooks/hooks.json` 里的 `SessionStart` 段即可(可插拔)。
+- `resume` / `compact` / `fork` 场景**不注入**(它们本来就带着上下文)。
+- 注入 ≤2KB,几乎不占窗口;末尾固定声明"是背景不是指令",防止新 session 被带偏。
+- 摘要级继承 + 指针按需展开:细节随时 `cclens diff <id>` 拿,要完整对话用 `claude --resume`。
+- 手动模式:`cclens handoff [session前缀]` 或会话里 `/cc-lens:handoff`,查任意历史 session。
 
-## 工作原理
+## 功能四:滚动进展笔记
+
+上一节摘要里的 "progress note" 来自这里:每轮对话结束,Stop hook 在**后台**(派生独立进程,对话零延迟)把转录增量喂给廉价模型,滚动维护一份 ≤120 词的笔记:目标 / 已完成 / 关键决策 / 待办。
+
+准确性设计:
+
+- prompt 硬约束**只许摘录、不许推断、不确定就删**;
+- summarizer 三级降级:`claude -p`(Haiku)→ `codex exec` → 都没有就不生成,handoff 自动退回"最后一条回复"的零幻觉逐字摘录;
+- 增量太小(<1.5KB)不浪费模型调用;env 哨兵防递归;锁文件防并发。
+
+笔记存于 `~/.claude/cc-lens/notes/<session_id>.json`,不想要模型参与就把 summarizer 设为 `off`(见下节)。
+
+---
+
+## 配置
+
+`~/.claude/cc-lens/config.json`(不存在则全部默认):
+
+```json
+{
+  "summarizer": "auto"
+}
+```
+
+| 键 | 取值 | 说明 |
+|---|---|---|
+| `summarizer` | `auto`(默认) / `claude` / `codex` / `off` | 笔记用哪个模型;`off` = 纯规则摘录,零成本零幻觉 |
+| `summarizer_cmd` | 命令数组 | 高级:自定义 summarizer 命令,prompt 作为最后一个参数传入 |
+
+环境变量:`CC_LENS_HOME` 重定向数据目录(默认 `~/.claude/cc-lens`);`CC_LENS_COLOR=1` 在非 TTY 强制彩色。
+
+按需裁剪(可插拔的含义):不想要哪个能力,删掉 hooks.json 里对应的段即可——`PreToolUse`=快照、`Stop`=笔记、`SessionStart`=注入,三者互不依赖。
+
+---
+
+## 工作原理与目录结构
 
 ```
 cc-lens/
 ├── .claude-plugin/
-│   ├── plugin.json          # 插件清单
-│   └── marketplace.json     # 仓库本身即 marketplace
-├── hooks/hooks.json         # PreToolUse: Write|Edit|MultiEdit|NotebookEdit
-├── scripts/snapshot.py      # 改动前快照原始文件 → ~/.claude/cc-lens/baselines/<session>/
-├── bin/cclens               # CLI:diff / sessions
-└── commands/                # /cc-lens:diff、/cc-lens:sessions
+│   ├── plugin.json          # Claude Code 插件清单
+│   └── marketplace.json     # 本仓库自身即 marketplace
+├── hooks/hooks.json         # Claude Code:PreToolUse + Stop + SessionStart
+├── scripts/
+│   ├── snapshot.py          # 改动前快照(Edit/Write 的 file_path;apply_patch 解析 patch 文本)
+│   └── notes.py             # 滚动笔记(hook 秒回,worker 后台跑)
+├── bin/cclens               # CLI:sessions / diff / handoff / install
+└── commands/                # /cc-lens:diff、/cc-lens:sessions、/cc-lens:handoff
 ```
 
-- **快照**:hook 从 stdin 读事件 JSON,同一 session 内每个文件只在首次改动前留一份底(新建文件记为 `[new]`)。hook 永远 exit 0,绝不阻塞编辑。
-- **session 统计**:解析 `~/.claude/projects/*/*.jsonl` 转录,只读每个文件的头尾各几百 KB,大转录也秒开。
-- 快照目录可用环境变量 `CC_LENS_HOME` 重定向;`--color` 或 `CC_LENS_COLOR=1` 在非 TTY 下强制彩色。
+数据源全部只读解析、原样摘录:Claude Code 转录 `~/.claude/projects/*/*.jsonl`,Codex rollout `~/.codex/sessions/**/rollout-*.jsonl`。所有 hook 永远 exit 0,观察不阻塞;快照/笔记数据只落在本机。
+
+## FAQ
+
+**装完 `/cc-lens:diff` 说没有快照?**
+快照从安装后的**下一次**文件改动才开始记(hook 需重启生效)。装好重启,让 AI 改一次文件即可。
+
+**Codex 里 hook 没跑?**
+三个前提:codex ≥ 0.114;`/hooks` 里信任过 cc-lens 条目;`config.toml` 没有 `[features] hooks = false`。cc-lens 更新路径后需要在 `/hooks` 里重新信任一次。
+
+**笔记会不会编造内容?**
+prompt 层面禁止推断,且 handoff 里明确标注 `model-maintained, quote-only` 供辨别;完全不放心就设 `"summarizer": "off"`,退回逐字摘录,准确性与原文等同。
+
+**窗口占用和 `/context` 显示的不完全一致?**
+cc-lens 读的是转录里最近一轮的用量,转录是异步写的,可能滞后一轮;数量级和趋势是准的。
+
+**卸载?**
+Claude Code:`/plugin uninstall cc-lens`。Codex:删掉 `~/.codex/hooks.json` 里 command 含 `cc-lens` 的条目(安装时有自动备份可回滚)。数据目录 `~/.claude/cc-lens/` 可整个删除。
 
 ## License
 
