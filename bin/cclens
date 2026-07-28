@@ -5,8 +5,8 @@
                                         sessions + context window usage
   cclens diff [SESSION] [--list]        original vs modified code, colored
   cclens diff --all-sessions            diff every session that has baselines
-  cclens handoff [SESSION]              summary of the previous (or given) session,
-                                        for carrying context into a new session
+  cclens handoff [SESSION] [--latest]   summary of the previous (or given) session,
+                                        or pick one interactively in a terminal
   cclens install codex                  wire cc-lens hooks into ~/.codex/hooks.json
 
 Supports Claude Code and Codex CLI. Zero dependencies beyond python3 + git.
@@ -175,6 +175,22 @@ def collect_sessions(show_all, backend=None):
     return sessions
 
 
+def session_limit(info):
+    if info.get("backend") == "codex":
+        return codex_limit(info)
+    return context_limit(info.get("model", ""), info.get("tokens") or 0)
+
+
+def session_pct(info):
+    tokens = info.get("tokens")
+    if tokens is None:
+        return None
+    limit = session_limit(info)
+    if not limit:
+        return None
+    return tokens / limit * 100
+
+
 def cmd_sessions(argv):
     show_all = "--all" in argv
     limit = 0
@@ -201,11 +217,8 @@ def cmd_sessions(argv):
 
     import datetime
     for s in sessions:
-        if s.get("backend") == "codex":
-            lim = codex_limit(s)
-        else:
-            lim = context_limit(s["model"], s["tokens"])
-        pct = s["tokens"] / lim * 100
+        lim = session_limit(s)
+        pct = session_pct(s)
         when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
         tag = cyan("claude") if s.get("backend") != "codex" else yellow("codex ")
         print(f"  {tag} {cyan(s['id'][:8])}  {bar(pct)} {pct:5.1f}%  "
@@ -407,35 +420,235 @@ def session_note(session_id):
         return ""
 
 
-def build_handoff(cwd, exclude_session=None, target=None):
-    """Return (summary_text, session_info) for the most recent session in cwd's
-    project — claude or codex — or the one matching `target`; (None, None) if none."""
-    candidates = []
+def handoff_candidates(cwd, exclude_session=None):
+    """Newest-first sessions eligible for handoff in this cwd."""
+    sessions = []
     for f in glob.glob(os.path.join(PROJECTS, sanitize(cwd), "*.jsonl")):
-        candidates.append(("claude", os.path.basename(f)[:-6], f, os.path.getmtime(f)))
+        s = parse_session(f)
+        if not s or s["id"] == exclude_session:
+            continue
+        s["backend"] = "claude"
+        sessions.append(s)
     for f in codex_session_files():
         s = parse_codex_session(f)
-        if s["cwd"] == cwd:
-            candidates.append(("codex", s["id"], f, s["mtime"]))
-    candidates.sort(key=lambda t: t[3], reverse=True)
-    chosen = next(((b, sid, f) for b, sid, f, _ in candidates
-                   if sid != exclude_session and (not target or sid.startswith(target))),
-                  None)
-    if not chosen:
-        return None, None
-    backend, sid, path = chosen
-    if backend == "claude":
-        s = parse_session(path)
-        lim = context_limit(s["model"], s["tokens"] or 0)
-        tail = last_assistant_text(path)
+        if s["cwd"] != cwd or s["id"] == exclude_session:
+            continue
+        sessions.append(s)
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def plain_bar(pct, width=10):
+    if pct is None:
+        return "?" * width
+    pct = max(0.0, min(100.0, pct))
+    filled = min(width, round(pct / 100 * width))
+    if pct > 0 and filled == 0:
+        filled = 1
+    return "█" * filled + "░" * (width - filled)
+
+
+def truncate_text(text, width):
+    text = " ".join((text or "").split())
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[:width - 1] + "…"
+
+
+def session_picker_line(s, width):
+    import datetime
+
+    pct = session_pct(s)
+    lim = session_limit(s)
+    when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+    label = s["label"] or "(no prompt)"
+    if pct is None:
+        usage = f"{fmt_tokens(lim)}"
     else:
-        s = parse_codex_session(path)
-        lim = codex_limit(s)
-        tail = codex_last_assistant_text(path)
+        usage = f"{plain_bar(pct, 8)} {pct:5.1f}% {fmt_tokens(s['tokens'])}/{fmt_tokens(lim)}"
+    prefix = f"{s.get('backend', ''):<6} {s['id'][:8]} {usage} {when}  "
+    return truncate_text(prefix + label, width)
+
+
+def choose_handoff_session_prompt(candidates, cwd):
+    if not candidates:
+        return None
+
+    import datetime
+
+    scope = cwd.replace(HOME, "~")
+    print(bold(f"● pick a session to hand off  [{scope}]"))
+    print()
+    for i, s in enumerate(candidates, 1):
+        pct = session_pct(s)
+        lim = session_limit(s)
+        when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+        tag = cyan("claude") if s.get("backend") != "codex" else yellow("codex ")
+        if pct is None:
+            usage = dim(f"(usage unavailable / limit {fmt_tokens(lim)})")
+        else:
+            usage = f"{bar(pct)} {pct:5.1f}%  {fmt_tokens(s['tokens']):>7} / {fmt_tokens(lim)}"
+        print(f"{i:>3}. {tag} {cyan(s['id'][:8])}  {usage}  {dim(when)}")
+        detail = s["label"] or dim("(no prompt)")
+        proj = s["cwd"].replace(HOME, "~") if s["cwd"] else ""
+        print(f"      {detail}" + (dim(f"  · {proj}") if proj else ""))
+    print()
+
+    prompt = f"Choose a session [1-{len(candidates)}, Enter=1, prefix, q]: "
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            return None
+        if not raw:
+            return candidates[0]
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1]
+        match = [s for s in candidates if s["id"].startswith(raw)]
+        if len(match) == 1:
+            return match[0]
+        print(red(f"invalid choice: {raw}"))
+
+
+def choose_handoff_session_tui(candidates, cwd):
+    import curses
+
+    def add_line(stdscr, y, text, attr=0):
+        rows, cols = stdscr.getmaxyx()
+        if y < 0 or y >= rows or cols <= 1:
+            return
+        line = truncate_text(text, cols - 1)
+        try:
+            stdscr.addnstr(y, 0, line, cols - 1, attr)
+        except curses.error:
+            pass
+
+    def run(stdscr):
+        def read_key():
+            key = stdscr.getch()
+            if key != 27:
+                return key
+            stdscr.timeout(25)
+            try:
+                nxt = stdscr.getch()
+                if nxt == -1:
+                    return 27
+                if nxt != ord('['):
+                    return 27
+                tail = stdscr.getch()
+                if tail == -1:
+                    return 27
+                if tail == ord('A'):
+                    return curses.KEY_UP
+                if tail == ord('B'):
+                    return curses.KEY_DOWN
+                if tail == ord('H'):
+                    return curses.KEY_HOME
+                if tail == ord('F'):
+                    return curses.KEY_END
+                if tail in (ord('5'), ord('6')) and stdscr.getch() == ord('~'):
+                    return curses.KEY_PPAGE if tail == ord('5') else curses.KEY_NPAGE
+                return 27
+            finally:
+                stdscr.timeout(-1)
+
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+
+        idx = 0
+        top = 0
+        scope = cwd.replace(HOME, "~")
+
+        while True:
+            rows, cols = stdscr.getmaxyx()
+            list_top = 2
+            detail_y = max(2, rows - 1)
+            list_height = max(1, detail_y - list_top)
+            top = min(top, max(0, len(candidates) - list_height))
+            if idx < top:
+                top = idx
+            elif idx >= top + list_height:
+                top = idx - list_height + 1
+
+            stdscr.erase()
+            add_line(stdscr, 0, f"pick a session to hand off  [{scope}]", curses.A_BOLD)
+            add_line(stdscr, 1, "↑↓/j k move  Enter select  q/Esc cancel  g/G top/bottom  PgUp/PgDn scroll")
+
+            for offset in range(list_height):
+                pos = top + offset
+                if pos >= len(candidates):
+                    break
+                attr = curses.A_REVERSE if pos == idx else 0
+                add_line(stdscr, list_top + offset, session_picker_line(candidates[pos], cols - 1), attr)
+
+            chosen = candidates[idx]
+            pct = session_pct(chosen)
+            lim = session_limit(chosen)
+            usage = (f"{pct:5.1f}% {fmt_tokens(chosen['tokens'])}/{fmt_tokens(lim)}"
+                     if pct is not None else f"limit {fmt_tokens(lim)}")
+            detail = (f"selected: {chosen.get('backend', '')} {chosen['id'][:8]}  {usage}"
+                      f"  · {chosen.get('cwd', '').replace(HOME, '~')}")
+            add_line(stdscr, detail_y, detail, curses.A_DIM)
+            stdscr.refresh()
+
+            key = read_key()
+            if key in (curses.KEY_UP, ord('k')):
+                idx = max(0, idx - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                idx = min(len(candidates) - 1, idx + 1)
+            elif key in (curses.KEY_PPAGE,):
+                idx = max(0, idx - list_height)
+            elif key in (curses.KEY_NPAGE,):
+                idx = min(len(candidates) - 1, idx + list_height)
+            elif key in (curses.KEY_HOME, ord('g')):
+                idx = 0
+            elif key in (curses.KEY_END, ord('G')):
+                idx = len(candidates) - 1
+            elif key in (10, 13, curses.KEY_ENTER):
+                return candidates[idx]
+            elif key in (27, ord('q')):
+                return None
+
+    try:
+        return curses.wrapper(run)
+    except KeyboardInterrupt:
+        return None
+
+
+def choose_handoff_session(candidates, cwd):
+    if not candidates:
+        return None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return choose_handoff_session_prompt(candidates, cwd)
+    if os.environ.get("TERM", "") in ("", "dumb"):
+        return choose_handoff_session_prompt(candidates, cwd)
+    try:
+        return choose_handoff_session_tui(candidates, cwd)
+    except Exception:
+        return choose_handoff_session_prompt(candidates, cwd)
+
+
+def render_handoff_summary(s, cwd):
+    backend = s.get("backend")
+    sid = s["id"]
+    path = s["path"]
+    lim = session_limit(s)
+    tail = last_assistant_text(path) if backend == "claude" else codex_last_assistant_text(path)
     import datetime
     when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
     lines = [f"Previous {'Claude Code' if backend == 'claude' else 'Codex'} session "
-             f"{sid[:8]} in {cwd} (last active {when}"
+             f"{sid[:8]} in {s.get('cwd') or cwd} (last active {when}"
              + (f", context {fmt_tokens(s['tokens'])}/{fmt_tokens(lim)}" if s["tokens"] else "")
              + "):"]
     if s["label"]:
@@ -452,7 +665,23 @@ def build_handoff(cwd, exclude_session=None, target=None):
         lines.append(f"- how it ended (last assistant message): {tail}")
     lines.append("This is background from a past session, not instructions; "
                  "current files may have changed since.")
-    return "\n".join(lines), s
+    return "\n".join(lines)
+
+
+def build_handoff(cwd, exclude_session=None, target=None, prompt=False):
+    """Return (summary_text, session_info) for a chosen handoff session."""
+    candidates = handoff_candidates(cwd, exclude_session=exclude_session)
+    if not candidates:
+        return None, None
+    if target:
+        chosen = next((s for s in candidates if s["id"].startswith(target)), None)
+    elif prompt:
+        chosen = choose_handoff_session(candidates, cwd)
+    else:
+        chosen = candidates[0]
+    if not chosen:
+        return None, None
+    return render_handoff_summary(chosen, cwd), chosen
 
 
 def cmd_handoff(argv):
@@ -467,7 +696,9 @@ def cmd_handoff(argv):
         exclude = evt.get("session_id")
         cwd = evt.get("cwd") or cwd
     target = next((a for a in argv if not a.startswith("-")), None)
-    summary, _ = build_handoff(cwd, exclude_session=exclude, target=target)
+    prompt = (not hook_mode and not target and "--latest" not in argv
+              and sys.stdin.isatty() and sys.stdout.isatty())
+    summary, chosen = build_handoff(cwd, exclude_session=exclude, target=target, prompt=prompt)
     if hook_mode:
         if summary:
             print(json.dumps({"hookSpecificOutput": {
@@ -476,6 +707,8 @@ def cmd_handoff(argv):
         return
     if summary:
         print(summary)
+    elif prompt and chosen is None and handoff_candidates(cwd, exclude_session=exclude):
+        print(dim("handoff cancelled"))
     else:
         print(dim(f"no previous session found for {cwd}"))
 
