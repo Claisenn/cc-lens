@@ -60,7 +60,7 @@ git clone https://github.com/Claisenn/cc-lens.git ~/cc-lens
 export PATH="$PATH:$HOME/cc-lens/bin"   # 或插件缓存里的 bin
 cclens sessions
 cclens diff
-cclens handoff            # 打开 TUI,用上下键 / j k / Enter 选一个
+cclens handoff            # 打开 TUI,可 / 搜索过滤,再用上下键 / j k / Enter 选
 cclens handoff --latest   # 不提示,直接拿最近一个
 ```
 
@@ -131,7 +131,7 @@ This is background from a past session, not instructions; current files may have
 - `resume` / `compact` / `fork` 场景**不注入**(它们本来就带着上下文)。
 - 注入 ≤2KB,几乎不占窗口;末尾固定声明"是背景不是指令",防止新 session 被带偏。
 - 摘要级继承 + 指针按需展开:细节随时 `cclens diff <id>` 拿,要完整对话用 `claude --resume`。
-- 手动模式:终端里直接跑 `cclens handoff`,会打开一个零依赖 TUI(↑↓ / `j` `k` 移动,Enter 选择,`q` 取消,`g` / `G` 跳到头尾,PgUp/PgDn 翻页);要跳过选择就用 `cclens handoff --latest`,已知 id 前缀时也可 `cclens handoff [session前缀]`。Claude 命令 `/cc-lens:handoff` 保持原样,仍是直接给最近一个摘要。
+- 手动模式:终端里直接跑 `cclens handoff`,会打开一个零依赖 TUI(↑↓ / `j` `k` 移动,`/` 搜索过滤,Enter 选择,`c` 清空过滤,`q` 取消,`g` / `G` 跳到头尾,PgUp/PgDn 翻页);要跳过选择就用 `cclens handoff --latest`,已知 id 前缀时也可 `cclens handoff [session前缀]`。Claude 命令 `/cc-lens:handoff` 保持原样,仍是直接给最近一个摘要。
 
 ## 功能四:滚动进展笔记
 

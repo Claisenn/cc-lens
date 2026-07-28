@@ -474,6 +474,23 @@ def session_picker_line(s, width):
     return truncate_text(prefix + label, width)
 
 
+def session_search_text(s):
+    parts = [
+        s.get("backend", ""),
+        s.get("id", ""),
+        s.get("label", ""),
+        s.get("cwd", ""),
+    ]
+    return " ".join(parts).lower()
+
+
+def filter_handoff_candidates(candidates, query):
+    needle = " ".join((query or "").lower().split())
+    if not needle:
+        return candidates
+    return [s for s in candidates if needle in session_search_text(s)]
+
+
 def choose_handoff_session_prompt(candidates, cwd):
     if not candidates:
         return None
@@ -569,13 +586,22 @@ def choose_handoff_session_tui(candidates, cwd):
         idx = 0
         top = 0
         scope = cwd.replace(HOME, "~")
+        query = ""
+        search_mode = False
+        search_buffer = ""
+        search_restore = ""
 
         while True:
+            active_query = search_buffer if search_mode else query
+            visible = filter_handoff_candidates(candidates, active_query)
+            if idx >= len(visible):
+                idx = max(0, len(visible) - 1)
+
             rows, cols = stdscr.getmaxyx()
-            list_top = 2
-            detail_y = max(2, rows - 1)
+            list_top = 3
+            detail_y = max(3, rows - 1)
             list_height = max(1, detail_y - list_top)
-            top = min(top, max(0, len(candidates) - list_height))
+            top = min(top, max(0, len(visible) - list_height))
             if idx < top:
                 top = idx
             elif idx >= top + list_height:
@@ -583,40 +609,81 @@ def choose_handoff_session_tui(candidates, cwd):
 
             stdscr.erase()
             add_line(stdscr, 0, f"pick a session to hand off  [{scope}]", curses.A_BOLD)
-            add_line(stdscr, 1, "↑↓/j k move  Enter select  q/Esc cancel  g/G top/bottom  PgUp/PgDn scroll")
+            add_line(stdscr, 1, "↑↓/j k move  Enter select  / search  q/Esc cancel  g/G top/bottom  PgUp/PgDn scroll")
+            if search_mode:
+                prompt = f"search: {search_buffer}_"
+                status = f"Enter apply  Esc cancel  ({len(visible)}/{len(candidates)} matches)"
+                add_line(stdscr, 2, f"{prompt}  {status}", curses.A_BOLD)
+            elif query:
+                status = f"filter: {query}  ({len(visible)}/{len(candidates)} matches)  / edit  c clear"
+                add_line(stdscr, 2, status, curses.A_DIM)
+            else:
+                add_line(stdscr, 2, "filter: none  (/ to search)", curses.A_DIM)
 
             for offset in range(list_height):
                 pos = top + offset
-                if pos >= len(candidates):
+                if pos >= len(visible):
                     break
                 attr = curses.A_REVERSE if pos == idx else 0
-                add_line(stdscr, list_top + offset, session_picker_line(candidates[pos], cols - 1), attr)
+                add_line(stdscr, list_top + offset, session_picker_line(visible[pos], cols - 1), attr)
 
-            chosen = candidates[idx]
-            pct = session_pct(chosen)
-            lim = session_limit(chosen)
-            usage = (f"{pct:5.1f}% {fmt_tokens(chosen['tokens'])}/{fmt_tokens(lim)}"
-                     if pct is not None else f"limit {fmt_tokens(lim)}")
-            detail = (f"selected: {chosen.get('backend', '')} {chosen['id'][:8]}  {usage}"
-                      f"  · {chosen.get('cwd', '').replace(HOME, '~')}")
+            if visible:
+                chosen = visible[idx]
+                pct = session_pct(chosen)
+                lim = session_limit(chosen)
+                usage = (f"{pct:5.1f}% {fmt_tokens(chosen['tokens'])}/{fmt_tokens(lim)}"
+                         if pct is not None else f"limit {fmt_tokens(lim)}")
+                detail = (f"selected: {chosen.get('backend', '')} {chosen['id'][:8]}  {usage}"
+                          f"  · {chosen.get('cwd', '').replace(HOME, '~')}")
+            else:
+                detail = "no matches for current filter"
             add_line(stdscr, detail_y, detail, curses.A_DIM)
             stdscr.refresh()
 
             key = read_key()
-            if key in (curses.KEY_UP, ord('k')):
-                idx = max(0, idx - 1)
-            elif key in (curses.KEY_DOWN, ord('j')):
-                idx = min(len(candidates) - 1, idx + 1)
-            elif key in (curses.KEY_PPAGE,):
-                idx = max(0, idx - list_height)
-            elif key in (curses.KEY_NPAGE,):
-                idx = min(len(candidates) - 1, idx + list_height)
-            elif key in (curses.KEY_HOME, ord('g')):
+            if search_mode:
+                if key in (10, 13, curses.KEY_ENTER):
+                    query = " ".join(search_buffer.split())
+                    search_mode = False
+                    idx = 0
+                    top = 0
+                elif key == 27:
+                    search_buffer = search_restore
+                    search_mode = False
+                    idx = 0
+                    top = 0
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    search_buffer = search_buffer[:-1]
+                    idx = 0
+                    top = 0
+                elif 32 <= key <= 126:
+                    search_buffer += chr(key)
+                    idx = 0
+                    top = 0
+                continue
+
+            if key == ord('/'):
+                search_mode = True
+                search_restore = query
+                search_buffer = query
+            elif key == ord('c') and query:
+                query = ""
                 idx = 0
-            elif key in (curses.KEY_END, ord('G')):
-                idx = len(candidates) - 1
-            elif key in (10, 13, curses.KEY_ENTER):
-                return candidates[idx]
+                top = 0
+            elif key in (curses.KEY_UP, ord('k')) and visible:
+                idx = max(0, idx - 1)
+            elif key in (curses.KEY_DOWN, ord('j')) and visible:
+                idx = min(len(visible) - 1, idx + 1)
+            elif key in (curses.KEY_PPAGE,) and visible:
+                idx = max(0, idx - list_height)
+            elif key in (curses.KEY_NPAGE,) and visible:
+                idx = min(len(visible) - 1, idx + list_height)
+            elif key in (curses.KEY_HOME, ord('g')) and visible:
+                idx = 0
+            elif key in (curses.KEY_END, ord('G')) and visible:
+                idx = len(visible) - 1
+            elif key in (10, 13, curses.KEY_ENTER) and visible:
+                return visible[idx]
             elif key in (27, ord('q')):
                 return None
 
