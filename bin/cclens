@@ -7,16 +7,23 @@
   cclens diff --all-sessions            diff every session that has baselines
   cclens handoff [SESSION] [--latest]   summary of the previous (or given) session,
                                         or pick one interactively in a terminal
+  cclens launch claude|codex [-- ARGS]  pick a handoff before starting a new session
+  cclens shell-init                     emit shell functions so claude/codex launch
+                                        through the pre-launch picker
   cclens install codex                  wire cc-lens hooks into ~/.codex/hooks.json
 
 Supports Claude Code and Codex CLI. Zero dependencies beyond python3 + git.
 """
 import glob
+import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 
 HOME = os.path.expanduser("~")
 LENS_HOME = os.path.expanduser(os.environ.get("CC_LENS_HOME", "~/.claude/cc-lens"))
@@ -752,9 +759,39 @@ def build_handoff(cwd, exclude_session=None, target=None, prompt=False):
 
 
 def cmd_handoff(argv):
-    hook_mode = "--hook" in argv
+    hook_mode = "--hook" in argv or "--launch-hook" in argv
     exclude = None
     cwd = os.getcwd()
+    if "--launch-hook" in argv:
+        ticket = os.environ.get("CC_LENS_HANDOFF_TICKET")
+        if not ticket:
+            return
+        try:
+            launch_dir = os.path.realpath(os.path.join(LENS_HOME, "launch"))
+            real_ticket = os.path.realpath(ticket)
+            name = os.path.basename(ticket)
+            if (os.path.dirname(real_ticket) != launch_dir
+                    or not name.startswith("handoff-") or not name.endswith(".txt")):
+                return
+            ticket_stat = os.lstat(ticket)
+            if (not stat.S_ISREG(ticket_stat.st_mode)
+                    or ticket_stat.st_uid != os.getuid()
+                    or stat.S_ISLNK(ticket_stat.st_mode)):
+                return
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(ticket, flags)
+            with os.fdopen(fd) as file:
+                summary = file.read(4097).strip()
+            os.unlink(ticket)
+        except OSError:
+            return
+        if len(summary) > 4096:
+            return
+        if summary:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "[cc-lens handoff]\n" + summary}}))
+        return
     if hook_mode:
         try:
             evt = json.load(sys.stdin)
@@ -780,7 +817,248 @@ def cmd_handoff(argv):
         print(dim(f"no previous session found for {cwd}"))
 
 
+# ---------------------------------------------------------------- launch
+
+CLAUDE_NON_SESSION_COMMANDS = {"agents", "auth", "auto-mode", "doctor", "gateway", "install", "mcp"}
+CODEX_NON_SESSION_COMMANDS = {
+    "app", "app-server", "apply", "archive", "cloud", "completion", "debug", "delete",
+    "doctor", "exec", "exec-server", "features", "fork", "help", "login", "logout", "mcp",
+    "mcp-server", "plugin", "remote-control", "resume", "review", "sandbox", "unarchive",
+    "update",
+}
+
+
+def has_arg(argv, *names):
+    return any(arg in names or any(arg.startswith(name + "=") for name in names)
+               for arg in argv)
+
+
+def first_command(argv):
+    """Best-effort first positional token; enough to identify CLI subcommands."""
+    options_with_value = {
+        "-a", "--add-dir", "--agent", "--agents", "--allowedTools", "--allowed-tools",
+        "--append-system-prompt", "--betas", "-c", "--cd", "--config", "--debug-file",
+        "--disallowedTools", "--disallowed-tools", "--effort", "--fallback-model", "--file",
+        "--from-pr", "-i", "--image", "--input-format", "--json-schema", "-m", "--max-budget-usd",
+        "--mcp-config", "--model", "-n", "--name", "--output-format", "-p", "--permission-mode",
+        "--plugin-dir", "--plugin-url", "--profile", "--remote", "--remote-auth-token-env",
+        "--remote-control-session-name-prefix", "-r", "--resume", "-s", "--sandbox",
+        "--session-id", "--setting-sources", "--settings", "--system-prompt", "--tools",
+    }
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg == "--":
+            continue
+        if arg in options_with_value:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return None
+
+
+def should_pick_on_launch(backend, argv):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    if has_arg(argv, "-h", "--help", "-v", "-V", "--version"):
+        return False
+    if backend == "claude":
+        if has_arg(argv, "-r", "--resume", "-c", "--continue", "--fork-session",
+                   "--from-pr", "-p", "--print", "--safe-mode", "--bare"):
+            return False
+        return first_command(argv) not in CLAUDE_NON_SESSION_COMMANDS
+    if backend == "codex":
+        return first_command(argv) not in CODEX_NON_SESSION_COMMANDS
+    return False
+
+
+def resolve_agent_command(backend):
+    override = os.environ.get(f"CC_LENS_{backend.upper()}_BIN")
+    if override:
+        return override
+    command = shutil.which(backend)
+    if command and os.path.realpath(command) != os.path.realpath(__file__):
+        return command
+    return backend
+
+
+def create_handoff_ticket(summary):
+    directory = os.path.join(LENS_HOME, "launch")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="handoff-", suffix=".txt", dir=directory, text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as file:
+            file.write(summary)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def cmd_launch(argv):
+    if not argv or argv[0] not in ("claude", "codex"):
+        print("usage: cclens launch claude|codex [-- ARGS]")
+        sys.exit(1)
+    backend = argv[0]
+    agent_args = argv[1:]
+    if agent_args[:1] == ["--"]:
+        agent_args = agent_args[1:]
+    executable = resolve_agent_command(backend)
+    command = [executable] + agent_args
+
+    if should_pick_on_launch(backend, agent_args):
+        cwd = os.getcwd()
+        candidates = handoff_candidates(cwd)
+        chosen = choose_handoff_session(candidates, cwd) if candidates else None
+        if chosen:
+            summary = render_handoff_summary(chosen, cwd)
+            try:
+                ticket = create_handoff_ticket(summary)
+            except OSError as error:
+                print(red("cc-lens: cannot prepare handoff") + f" ({error})")
+                print(dim("starting a blank session"))
+            else:
+                os.environ["CC_LENS_HANDOFF_TICKET"] = ticket
+                print(green("✔") + f" handing off {chosen.get('backend')} session {chosen['id'][:8]}")
+        elif candidates:
+            print(dim("no handoff selected — starting a blank session"))
+
+    if os.environ.get("CC_LENS_LAUNCH_DRY_RUN") == "1":
+        print(json.dumps(command))
+        return
+    sys.stdout.flush()
+    os.execvp(executable, command)
+
+
+def cmd_shell_init(argv):
+    if argv:
+        print("usage: cclens shell-init")
+        sys.exit(1)
+    command = os.path.abspath(__file__)
+    quoted = "'" + command.replace("'", "'\\''") + "'"
+    print(f"""# cc-lens pre-launch session picker
+claude() {{ {quoted} launch claude -- \"$@\"; }}
+codex() {{ {quoted} launch codex -- \"$@\"; }}""")
+
+
 # ---------------------------------------------------------------- install
+
+HOOK_EVENT_KEY_LABELS = {
+    "PreToolUse": "pre_tool_use",
+    "PermissionRequest": "permission_request",
+    "PostToolUse": "post_tool_use",
+    "PreCompact": "pre_compact",
+    "PostCompact": "post_compact",
+    "SessionStart": "session_start",
+    "SessionEnd": "session_end",
+    "UserPromptSubmit": "user_prompt_submit",
+    "SubagentStart": "subagent_start",
+    "SubagentStop": "subagent_stop",
+    "Stop": "stop",
+}
+
+
+def hook_event_key_label(event_name):
+    return HOOK_EVENT_KEY_LABELS[event_name]
+
+
+def canonical_json(value):
+    if isinstance(value, dict):
+        return {key: canonical_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [canonical_json(item) for item in value]
+    return value
+
+
+def command_hook_trusted_hash(event_name, matcher, command, timeout_sec,
+                              status_message=None, additional_context_limit=None):
+    handler = {
+        "type": "command",
+        "command": command,
+        "timeout": timeout_sec,
+        "async": False,
+    }
+    if status_message is not None:
+        handler["statusMessage"] = status_message
+    if additional_context_limit is not None:
+        handler["additionalContextLimit"] = additional_context_limit
+    identity = {
+        "event_name": hook_event_key_label(event_name),
+        "hooks": [handler],
+    }
+    if matcher is not None:
+        identity["matcher"] = matcher
+    serialized = json.dumps(canonical_json(identity), separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def toml_quote_key(key):
+    return key.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def upsert_trusted_hash_text(text, hook_key, trusted_hash):
+    section = f'[hooks.state."{toml_quote_key(hook_key)}"]'
+    trusted_line = f'trusted_hash = "{trusted_hash}"\n'
+    lines = text.splitlines(keepends=True)
+    out = []
+    i = 0
+    found = False
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        if line.strip() == section:
+            found = True
+            i += 1
+            replaced = False
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.startswith("["):
+                    break
+                if not replaced and nxt.lstrip().startswith("trusted_hash = "):
+                    out.append(trusted_line)
+                    replaced = True
+                    i += 1
+                    continue
+                out.append(nxt)
+                i += 1
+            if not replaced:
+                out.append(trusted_line)
+            continue
+        i += 1
+    if not found:
+        if out and out[-1].strip():
+            out.append("\n")
+        out.append(section + "\n")
+        out.append(trusted_line)
+    return "".join(out)
+
+
+def install_codex_hook_trusts(config_path, trust_updates):
+    text = ""
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            text = f.read()
+    for hook_key, trusted_hash in trust_updates:
+        text = upsert_trusted_hash_text(text, hook_key, trusted_hash)
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    tmp = config_path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        if text and not text.endswith("\n"):
+            f.write("\n")
+    os.replace(tmp, config_path)
 
 CC_LENS_MARK = "cc-lens"
 
@@ -798,10 +1076,11 @@ def cmd_install(argv):
                        "command": f"{py} {shlex.quote(os.path.join(root, 'scripts', 'snapshot.py'))}"},
         "Stop": {"matcher": None,
                  "command": f"{py} {shlex.quote(os.path.join(root, 'scripts', 'notes.py'))}"},
-        "SessionStart": {"matcher": "startup|clear",
-                         "command": f"{py} {shlex.quote(os.path.join(root, 'bin', 'cclens'))} handoff --hook"},
+        "SessionStart": {"matcher": "startup",
+                         "command": f"{py} {shlex.quote(os.path.join(root, 'bin', 'cclens'))} handoff --launch-hook"},
     }
     path = os.path.join(HOME, ".codex", "hooks.json")
+    config_path = os.path.join(HOME, ".codex", "config.toml")
     doc = {"hooks": {}}
     if os.path.exists(path):
         with open(path) as f:
@@ -811,6 +1090,7 @@ def cmd_install(argv):
             json.dump(doc, f, indent=2)
         print(dim(f"backed up existing hooks.json -> {shutil_copy}"))
     hooks = doc.setdefault("hooks", {})
+    trust_updates = []
     for event, spec in ours.items():
         groups = hooks.setdefault(event, [])
         # drop any stale cc-lens entries (paths change across updates), keep others'
@@ -823,15 +1103,27 @@ def cmd_install(argv):
         if spec["matcher"]:
             entry["matcher"] = spec["matcher"]
         groups.append(entry)
+        group_index = len(groups) - 1
+        hook_key = f"{path}:{hook_event_key_label(event)}:{group_index}:0"
+        trusted_hash = command_hook_trusted_hash(
+            event,
+            spec["matcher"],
+            spec["command"],
+            20,
+            f"cc-lens {event.lower()}",
+        )
+        trust_updates.append((hook_key, trusted_hash))
     tmp = path + ".tmp"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(tmp, "w") as f:
         json.dump(doc, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)
+    install_codex_hook_trusts(config_path, trust_updates)
     print(green("✔") + f" cc-lens hooks merged into {path}")
-    print("  next: run " + bold("/hooks") + " inside Codex once to review & trust them "
-          "(Codex trust-pins hooks by hash).")
+    print("  trusted current cc-lens hook hashes in " + bold(config_path) + ".")
+    print("  next: add " + bold('eval "$(\"$HOME/cc-lens/bin/cclens\" shell-init)"')
+          + " to your shell rc if you want the pre-launch chooser on plain `codex`.")
     print("  uninstall: re-run this after deleting cc-lens, or remove entries whose "
           "command contains 'cc-lens'.")
 
@@ -852,6 +1144,10 @@ def main():
         cmd_diff(rest)
     elif cmd == "handoff":
         cmd_handoff(rest)
+    elif cmd == "launch":
+        cmd_launch(rest)
+    elif cmd == "shell-init":
+        cmd_shell_init(rest)
     elif cmd == "install":
         cmd_install(rest)
     else:

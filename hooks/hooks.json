@@ -24,11 +24,11 @@
     ],
     "SessionStart": [
       {
-        "matcher": "startup|clear",
+        "matcher": "startup",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/bin/cclens handoff --hook"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/bin/cclens handoff --launch-hook"
           }
         ]
       }
