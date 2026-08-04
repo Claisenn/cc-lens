@@ -336,7 +336,7 @@ def parse_codex_session(path):
             continue
         p = obj.get("payload") or {}
         if obj.get("type") == "session_meta":
-            info["id"] = p.get("session_id") or p.get("id") or info["id"]
+            info["id"] = p.get("id") or p.get("session_id") or info["id"]
             info["cwd"] = p.get("cwd", "")
             info["model"] = p.get("model") or p.get("model_provider", "")
         elif obj.get("type") == "response_item" and p.get("type") == "message" \
