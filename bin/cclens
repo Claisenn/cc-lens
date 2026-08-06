@@ -7,6 +7,8 @@
   cclens diff --all-sessions            diff every session that has baselines
   cclens handoff [SESSION] [--latest]   summary of the previous (or given) session,
                                         or pick one interactively in a terminal
+  cclens import <session-id-prefix>     print the full conversation of a session,
+                                        ready to paste into a new chat
   cclens launch claude|codex [-- ARGS]  pick a handoff before starting a new session
   cclens shell-init                     emit shell functions so claude/codex launch
                                         through the pre-launch picker
@@ -387,6 +389,172 @@ def codex_session_files():
 
 def codex_limit(info):
     return info.get("ctx_window") or 400_000  # gpt-5-codex family default
+
+
+# ---------------------------------------------------------------- import (full conversation)
+
+def _iter_jsonl(path):
+    """Yield parsed JSON objects from a jsonl file, skipping malformed lines."""
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    yield json.loads(raw)
+                except Exception:
+                    continue
+    except OSError:
+        return
+
+
+def _content_text(content):
+    """Flatten a message content (str or list of parts) into plain text."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    out = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype in ("text", "input_text", "output_text"):
+            t = part.get("text", "")
+            if t:
+                out.append(t)
+        elif ptype == "tool_use":
+            name = part.get("name", "")
+            inp = part.get("input") or {}
+            try:
+                out.append(f"[tool_use: {name}] {json.dumps(inp, ensure_ascii=False)[:400]}")
+            except Exception:
+                out.append(f"[tool_use: {name}]")
+        elif ptype == "tool_result":
+            # tool results can be huge; keep a short tag only
+            out.append("[tool_result]")
+    return "\n".join(out)
+
+
+def _is_claude_noise(text):
+    """Skip Claude's internal command echoes / local-command stdout wrappers."""
+    s = text.lstrip()
+    if s.startswith("<command-name>") or s.startswith("<local-command-stdout>")             or s.startswith("<local-command-stderr>") or s.startswith("<command-"):
+        return True
+    return False
+
+
+def extract_claude_conversation(path, max_chars=0):
+    """Return a list of (role, text) turns from a Claude Code transcript."""
+    turns = []
+    for obj in _iter_jsonl(path):
+        if obj.get("type") not in ("user", "assistant"):
+            continue
+        if obj.get("isSidechain") or obj.get("isMeta"):
+            continue
+        msg = obj.get("message") or {}
+        role = msg.get("role") or obj.get("type")
+        text = _content_text(msg.get("content"))
+        if not text.strip():
+            continue
+        if role == "user" and _is_claude_noise(text):
+            continue
+        # skip the auto-injected cc-lens handoff block so we don't recurse
+        if role == "user" and text.lstrip().startswith("[cc-lens handoff]"):
+            continue
+        turns.append((role, text))
+    return turns
+
+
+def extract_codex_conversation(path, max_chars=0):
+    """Return a list of (role, text) turns from a Codex rollout transcript."""
+    turns = []
+    for obj in _iter_jsonl(path):
+        if obj.get("type") != "response_item":
+            continue
+        p = obj.get("payload") or {}
+        if p.get("type") != "message":
+            continue
+        role = p.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        text = _content_text(p.get("content"))
+        if not text.strip():
+            continue
+        # skip the big permissions/system prompt blobs Codex injects
+        if role == "user" and text.lstrip().startswith("<"):
+            continue
+        if role == "user" and text.lstrip().startswith("[cc-lens handoff]"):
+            continue
+        turns.append((role, text))
+    return turns
+
+
+def format_conversation(turns, sid, backend, cwd, max_chars=0):
+    """Render turns into a compact, paste-ready transcript string."""
+    import datetime
+    lines = []
+    lines.append(f"# Imported conversation — {backend} session {sid[:8]}")
+    if cwd:
+        lines.append(f"# cwd: {cwd}")
+    lines.append("")
+    for role, text in turns:
+        head = "## USER" if role == "user" else "## ASSISTANT"
+        lines.append(head)
+        lines.append(text)
+        lines.append("")
+    out = "\n".join(lines).rstrip() + "\n"
+    if max_chars and len(out) > max_chars:
+        out = out[-max_chars:]
+        out = "# (truncated to most recent portion)\n" + out
+    return out
+
+
+def find_session_path(sid_prefix, cwd=None):
+    """Locate a transcript path by id prefix; returns (path, backend, cwd) or None."""
+    sid_prefix = (sid_prefix or "").strip()
+    if not sid_prefix:
+        return None
+    # Claude
+    for f in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        s = parse_session(f)
+        if s and s["id"].startswith(sid_prefix):
+            return f, "claude", s.get("cwd") or ""
+    # Codex
+    for f in codex_session_files():
+        s = parse_codex_session(f)
+        if s and s["id"].startswith(sid_prefix):
+            return f, "codex", s.get("cwd") or ""
+    return None
+
+
+def cmd_import(argv):
+    """Print the full conversation of a session so it can be pasted into a new chat."""
+    target = next((a for a in argv if not a.startswith("-")), None)
+    if not target:
+        print("usage: cclens import <session-id-prefix>")
+        print("       prints the full conversation of the given session,")
+        print("       ready to paste into a new chat to continue the work.")
+        sys.exit(1)
+    found = find_session_path(target)
+    if not found:
+        print(red(f"no session matching '{target}'. Try: cclens sessions --all"))
+        sys.exit(1)
+    path, backend, cwd = found
+    sid = os.path.basename(path)[:-6] if backend == "claude" else         "-".join(os.path.basename(path)[:-6].split("-")[-5:])
+    if backend == "claude":
+        turns = extract_claude_conversation(path)
+    else:
+        turns = extract_codex_conversation(path)
+    if not turns:
+        print(dim(f"no user/assistant turns found in session {sid[:8]}"))
+        return
+    text = format_conversation(turns, sid, backend, cwd)
+    # print a small hint on stderr so it doesn't pollute the pasteable stdout
+    sys.stderr.write(dim(f"# {len(turns)} turn(s) from {backend} session {sid[:8]} "
+                         f"({len(text)} chars) — copy the block below into a new chat.\n"))
+    print(text)
 
 
 # ---------------------------------------------------------------- handoff
@@ -1144,6 +1312,8 @@ def main():
         cmd_diff(rest)
     elif cmd == "handoff":
         cmd_handoff(rest)
+    elif cmd == "import":
+        cmd_import(rest)
     elif cmd == "launch":
         cmd_launch(rest)
     elif cmd == "shell-init":

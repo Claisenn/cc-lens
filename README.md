@@ -21,7 +21,8 @@
 2. [功能一:原始代码 vs 改动代码](#功能一原始代码-vs-改动代码)
 3. [功能二:session 列表与窗口占用](#功能二session-列表与窗口占用)
 4. [功能三:跨 session 上下文继承](#功能三跨-session-上下文继承)
-5. [功能四:滚动进展笔记](#功能四滚动进展笔记)
+5. [功能四:导入完整对话继续干活](#功能四导入完整对话继续干活)
+6. [功能五:滚动进展笔记](#功能五滚动进展笔记)
 6. [配置](#配置)
 7. [工作原理与目录结构](#工作原理与目录结构)
 8. [FAQ](#faq)
@@ -44,6 +45,7 @@
 | `/cc-lens:diff` | 看本 session 原始代码 vs 当前代码 |
 | `/cc-lens:sessions` | 看 session 数量和各自窗口占用 |
 | `/cc-lens:handoff` | 手动拉取上一个 session 的摘要 |
+| `/cc-lens:import <id>` | 打印某个 session 的完整对话,贴进新对话继续干 |
 
 要启用“先选历史 session,再进入 Claude”的启动前选择器,把下面一行加入 `~/.zshrc` 或 `~/.bashrc`:
 
@@ -72,6 +74,7 @@ cclens sessions
 cclens diff
 cclens handoff            # 打开 TUI,可 / 搜索过滤,再用上下键 / j k / Enter 选
 cclens handoff --latest   # 不提示,直接拿最近一个
+cclens import <id前缀>    # 打印某个 session 的完整对话,复制贴进新对话继续干
 ```
 
 ---
@@ -147,7 +150,28 @@ This is background from a past session, not instructions; current files may have
 
 启动包装不会替换或复制 Claude/Codex 本体。`cclens shell-init` 只定义两个 shell function,选择后仍 `exec` PATH 中原本的 CLI,所以现有参数、Codex provider wrapper 和升级流程保持不变。临时禁用可用 `command claude` / `command codex`。
 
-## 功能四:滚动进展笔记
+## 功能四:导入完整对话继续干活
+
+`handoff` 只给摘要,适合"知道个大概"。如果你想把另一个没结束的对话**整个搬过来**,在新对话里接着干,用 `import`:
+
+```bash
+cclens import <session-id 前缀>     # 终端里打印完整对话
+```
+
+或者在 Claude Code 里:
+
+```
+/cc-lens:import 252ee200
+```
+
+输出是一份带 `## USER` / `## ASSISTANT` 标记的纯文本对话,**直接整段复制贴进新对话的第一条消息**即可。新 session 会看到完整的来龙去脉,从上次停下的地方继续。
+
+- 先 `cclens sessions`(或 `/cc-lens:sessions`)找到要导入的 session id 前缀。
+- 自动过滤掉 Claude 的命令回显(`/model`、`/goal` 之类的本地包装)和 Codex 注入的权限/system prompt 大块,只留真实的 user / assistant 轮次。
+- 也会跳过 cc-lens 自己之前注入的 handoff 块,避免递归套娃。
+- 长对话会很大,贴之前可以先看一眼输出长度;想要更轻量的继承用 `cclens handoff`。
+
+## 功能五:滚动进展笔记
 
 上一节摘要里的 "progress note" 来自这里:每轮对话结束,Stop hook 在**后台**(派生独立进程,对话零延迟)把转录增量喂给廉价模型,滚动维护一份 ≤120 词的笔记:目标 / 已完成 / 关键决策 / 待办。
 
