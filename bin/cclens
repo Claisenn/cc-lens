@@ -7,10 +7,12 @@
   cclens diff --all-sessions            diff every session that has baselines
   cclens handoff [SESSION] [--latest]   summary of the previous (or given) session,
                                         or pick one interactively in a terminal
-  cclens import <session-id-prefix> [--copy]
+  cclens import <session-id-prefix>|self [--copy]
                                         print the full conversation of a session,
                                         ready to paste into a new chat; --copy also
-                                        puts it on the system clipboard
+                                        puts it on the system clipboard; use 'self'
+                                        for the session running in this shell
+  cclens current                       print the id of the session in this shell
   cclens launch claude|codex [-- ARGS]  pick a handoff before starting a new session
   cclens shell-init                     emit shell functions so claude/codex launch
                                         through the pre-launch picker
@@ -513,10 +515,46 @@ def format_conversation(turns, sid, backend, cwd, max_chars=0):
     return out
 
 
+def current_session(cwd=None):
+    """Best-effort detection of the session running in the current shell.
+
+    Codex exposes CODEX_THREAD_ID directly. Claude Code does not, so we fall
+    back to the most recently modified transcript under the current cwd's
+    project dir (transcripts are written live, so the newest one is almost
+    always the active session). Returns (id, backend, path) or None.
+    """
+    cwd = cwd or os.getcwd()
+    # Codex: env var is authoritative
+    tid = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
+    if tid:
+        for f in codex_session_files():
+            s = parse_codex_session(f)
+            if s and s["id"] == tid:
+                return s["id"], "codex", f
+        # id didn't match a known file (maybe not flushed yet); still return it
+        return tid, "codex", None
+    # Claude: newest transcript in this cwd's project dir
+    files = glob.glob(os.path.join(PROJECTS, sanitize(cwd), "*.jsonl"))
+    if files:
+        files.sort(key=os.path.getmtime, reverse=True)
+        s = parse_session(files[0])
+        if s:
+            return s["id"], "claude", files[0]
+    return None
+
+
 def find_session_path(sid_prefix, cwd=None):
-    """Locate a transcript path by id prefix; returns (path, backend, cwd) or None."""
+    """Locate a transcript path by id prefix; returns (path, backend, cwd) or None.
+
+    Pass "self" or "current" to resolve the session running in the current shell.
+    """
     sid_prefix = (sid_prefix or "").strip()
     if not sid_prefix:
+        return None
+    if sid_prefix.lower() in ("self", "current"):
+        cur = current_session(cwd)
+        if cur and cur[2]:
+            return cur[2], cur[1], ""
         return None
     # Claude
     for f in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
@@ -582,6 +620,24 @@ def cmd_import(argv):
     else:
         sys.stderr.write(dim(hint + " — copy the block below into a new chat.\n"))
         print(text)
+
+
+
+def cmd_current(argv):
+    """Print the id of the session running in the current shell, if detectable."""
+    cur = current_session()
+    if not cur:
+        print(dim("no active session detected in this shell"))
+        sys.exit(1)
+    sid, backend, path = cur
+    tag = "codex" if backend == "codex" else "claude"
+    print(f"{tag} {sid}")
+    if "--verbose" in argv or "-v" in argv:
+        if path:
+            print(dim(f"  transcript: {path}"))
+        else:
+            print(dim("  transcript: (not flushed to disk yet)"))
+
 
 
 # ---------------------------------------------------------------- handoff
@@ -1341,6 +1397,8 @@ def main():
         cmd_handoff(rest)
     elif cmd == "import":
         cmd_import(rest)
+    elif cmd == "current":
+        cmd_current(rest)
     elif cmd == "launch":
         cmd_launch(rest)
     elif cmd == "shell-init":

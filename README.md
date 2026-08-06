@@ -74,7 +74,8 @@ cclens sessions
 cclens diff
 cclens handoff            # 打开 TUI,可 / 搜索过滤,再用上下键 / j k / Enter 选
 cclens handoff --latest   # 不提示,直接拿最近一个
-cclens import <id前缀> [--copy]  # 打印完整对话;--copy 直接进剪贴板,贴进已开的对话
+cclens import <id前缀>|self [--copy]  # 打印完整对话;self=当前 session;--copy 进剪贴板
+cclens current                 # 打印当前 shell 里跑着的 session id
 ```
 
 ---
@@ -171,6 +172,8 @@ cclens import <session-id 前缀>     # 终端里打印完整对话
 - 也会跳过 cc-lens 自己之前注入的 handoff 块,避免递归套娃。
 - 长对话会很大,贴之前可以先看一眼输出长度;想要更轻量的继承用 `cclens handoff`。
 - 想直接贴进**已经开着的对话**?加 `--copy`(或 `-c`)直接复制到剪贴板:`cclens import <id> --copy`,然后在对话里 ⌘V 粘贴即可(macOS 用 `pbcopy`,Linux 用 `wl-copy`/`xclip`/`xsel`)。
+- 想导入**当前正在跑的这个 session**(不用先查 id)?用 `cclens import self`(或 `current`)。Codex 从 `CODEX_THREAD_ID` 环境变量直接拿;Claude Code 没有暴露 env,会回退到"当前 cwd 下最近写入的转录文件",几乎总是当前 session。
+- 只想看当前 session id 是多少:`cclens current`(加 `-v` 还会显示转录文件路径)。
 
 ## 功能五:滚动进展笔记
 
