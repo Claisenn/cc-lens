@@ -74,7 +74,7 @@ cclens sessions
 cclens diff
 cclens handoff            # 打开 TUI,可 / 搜索过滤,再用上下键 / j k / Enter 选
 cclens handoff --latest   # 不提示,直接拿最近一个
-cclens import <id前缀>    # 打印某个 session 的完整对话,复制贴进新对话继续干
+cclens import <id前缀> [--copy]  # 打印完整对话;--copy 直接进剪贴板,贴进已开的对话
 ```
 
 ---
@@ -170,6 +170,7 @@ cclens import <session-id 前缀>     # 终端里打印完整对话
 - 自动过滤掉 Claude 的命令回显(`/model`、`/goal` 之类的本地包装)和 Codex 注入的权限/system prompt 大块,只留真实的 user / assistant 轮次。
 - 也会跳过 cc-lens 自己之前注入的 handoff 块,避免递归套娃。
 - 长对话会很大,贴之前可以先看一眼输出长度;想要更轻量的继承用 `cclens handoff`。
+- 想直接贴进**已经开着的对话**?加 `--copy`(或 `-c`)直接复制到剪贴板:`cclens import <id> --copy`,然后在对话里 ⌘V 粘贴即可(macOS 用 `pbcopy`,Linux 用 `wl-copy`/`xclip`/`xsel`)。
 
 ## 功能五:滚动进展笔记
 

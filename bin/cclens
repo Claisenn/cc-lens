@@ -7,8 +7,10 @@
   cclens diff --all-sessions            diff every session that has baselines
   cclens handoff [SESSION] [--latest]   summary of the previous (or given) session,
                                         or pick one interactively in a terminal
-  cclens import <session-id-prefix>     print the full conversation of a session,
-                                        ready to paste into a new chat
+  cclens import <session-id-prefix> [--copy]
+                                        print the full conversation of a session,
+                                        ready to paste into a new chat; --copy also
+                                        puts it on the system clipboard
   cclens launch claude|codex [-- ARGS]  pick a handoff before starting a new session
   cclens shell-init                     emit shell functions so claude/codex launch
                                         through the pre-launch picker
@@ -529,13 +531,31 @@ def find_session_path(sid_prefix, cwd=None):
     return None
 
 
+def copy_to_clipboard(text):
+    """Copy text to the system clipboard; return the command used or None on failure."""
+    candidates = ["pbcopy", "wl-copy", "xclip -selection clipboard", "xsel --clipboard --input"]
+    for cmd in candidates:
+        exe = cmd.split()[0]
+        if shutil.which(exe):
+            try:
+                subprocess.run(cmd, input=text, text=True, shell=True, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return cmd
+            except Exception:
+                continue
+    return None
+
+
 def cmd_import(argv):
     """Print the full conversation of a session so it can be pasted into a new chat."""
     target = next((a for a in argv if not a.startswith("-")), None)
+    copy = "--copy" in argv or "-c" in argv
     if not target:
-        print("usage: cclens import <session-id-prefix>")
+        print("usage: cclens import <session-id-prefix> [--copy]")
         print("       prints the full conversation of the given session,")
         print("       ready to paste into a new chat to continue the work.")
+        print("       --copy / -c: also copy the output to the system clipboard")
+        print("              (handy when pasting into an already-open chat).")
         sys.exit(1)
     found = find_session_path(target)
     if not found:
@@ -551,10 +571,17 @@ def cmd_import(argv):
         print(dim(f"no user/assistant turns found in session {sid[:8]}"))
         return
     text = format_conversation(turns, sid, backend, cwd)
-    # print a small hint on stderr so it doesn't pollute the pasteable stdout
-    sys.stderr.write(dim(f"# {len(turns)} turn(s) from {backend} session {sid[:8]} "
-                         f"({len(text)} chars) — copy the block below into a new chat.\n"))
-    print(text)
+    hint = f"# {len(turns)} turn(s) from {backend} session {sid[:8]} ({len(text)} chars)"
+    if copy:
+        used = copy_to_clipboard(text)
+        if used:
+            sys.stderr.write(dim(hint + f" — copied to clipboard via {used.split()[0]}.\n"))
+        else:
+            sys.stderr.write(red(hint + " — could not find a clipboard tool (pbcopy/wl-copy/xclip/xsel).\n"))
+            print(text)
+    else:
+        sys.stderr.write(dim(hint + " — copy the block below into a new chat.\n"))
+        print(text)
 
 
 # ---------------------------------------------------------------- handoff
